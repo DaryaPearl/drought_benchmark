@@ -1,0 +1,11 @@
+defaults:
+  - base
+model:
+  name: tft
+  target: spi
+  max_enc_len: 12
+  max_pred_len: 1
+  params:
+    hidden_size: 64
+    attention_head_size: 4
+    dropout: 0.1

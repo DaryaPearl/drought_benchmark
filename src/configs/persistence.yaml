@@ -1,0 +1,17 @@
+model:
+  name: persistence
+
+data:
+  path: data/processed/agro_cube.zarr
+  features:
+    - spi3   # т.к. это единственное, что у нас есть сейчас
+  target: spi3
+  batch_size: 256
+  train_years: [2003, 2016]
+  val_years:   [2017, 2019]
+  test_years:  [2020, 2024]
+
+trainer:
+  max_epochs: 1
+  accelerator: auto
+  log_every_n_steps: 50

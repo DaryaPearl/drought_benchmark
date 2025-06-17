@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Datasets / Outputs
+data/
+results/
+*.zarr
+*.nc
+*.hdf
+
+# IDEs
+.vscode/
+.idea/
+
+# Hydra
+.hydra/
+
