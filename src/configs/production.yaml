@@ -1,0 +1,189 @@
+# configs/production.yaml
+# Конфигурация для продакшн развертывания
+
+project:
+  name: "drought_prediction_production"
+  description: "Production-ready drought prediction system"
+
+defaults:
+  - config
+
+# Оптимизированные данные для продакшна
+data:
+  # Реальное время + небольшая история
+  years_range: [2020, 2024]
+  
+  # Ключевые регионы
+  regions:
+    us_plains: [35, 48, -104, -90]
+    ru_steppe: [50, 55, 37, 47]
+  
+  # Только надежные переменные
+  input_variables:
+    - "precipitation"
+    - "temperature"
+    - "ndvi"
+    - "spi3"
+  
+  target_variable: "spi3"
+
+# Быстрое обучение для продакшна
+training:
+  sequence_length: 12
+  prediction_horizon: 3
+  
+  batch_size: 32
+  max_epochs: 50
+  learning_rate: 0.001
+  early_stopping_patience: 10
+
+# Только проверенные модели
+models:
+  classical:
+    random_forest:
+      enabled: true
+      n_estimators: 300
+      max_depth: 20
+    
+    xgboost:
+      enabled: true
+      n_estimators: 500
+      learning_rate: 0.05
+  
+  sota:
+    convlstm:
+      enabled: true
+      hidden_dims: [64, 32]
+
+# Продакшн настройки
+compute:
+  accelerator: "auto"
+  precision: 16
+  deterministic: true
+
+# Минимальное логирование
+logging:
+  level: "INFO"
+  tensorboard:
+    enabled: false
+  wandb:
+    enabled: false
+
+# Продакшн валидация
+evaluation:
+  metrics:
+    - "mae"
+    - "rmse"
+    - "r2"
+  
+  cross_validation:
+    enabled: false  # Отключаем для скорости
+
+# API настройки
+api:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  timeout: 30
+  
+  # Эндпоинты
+  endpoints:
+    predict: "/predict"
+    health: "/health"
+    metrics: "/metrics"
+    
+  # Валидация входных данных
+  input_validation:
+    enabled: true
+    max_sequence_length: 24
+    required_variables: ["precipitation", "temperature"]
+
+# Мониторинг продакшна
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  health_check_interval: 30
+  
+  # Алерты
+  alerts:
+    model_drift: true
+    prediction_quality: true
+    system_health: true
+  
+  # Метрики для мониторинга
+  tracked_metrics:
+    - "prediction_latency"
+    - "model_accuracy"
+    - "data_freshness"
+    - "system_load"
+
+# Безопасность продакшна
+security:
+  api_key_required: true
+  rate_limiting:
+    enabled: true
+    requests_per_minute: 100
+  
+  input_sanitization: true
+  output_validation: true
+
+# Docker конфигурация
+docker:
+  enabled: true
+  base_image: "pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime"
+  python_version: "3.9"
+  
+  # Переменные окружения
+  environment:
+    PYTHONPATH: "/app"
+    MODEL_PATH: "/models"
+    DATA_PATH: "/data"
+  
+  # Ресурсы
+  resources:
+    memory: "8Gi"
+    cpu: "4"
+    gpu: "0"  # CPU для продакшна
+
+# Автоматическое обновление модели
+model_updates:
+  enabled: true
+  schedule: "0 2 * * 0"  # Каждое воскресенье в 2:00
+  retrain_threshold: 0.1  # Переобучение при падении качества на 10%
+  validation_period: "7d"  # Валидация новой модели 7 дней
+  
+  # Откат к предыдущей версии
+  rollback:
+    enabled: true
+    quality_threshold: 0.05
+    monitoring_period: "24h"
+
+# Persistence и кэширование
+cache:
+  enabled: true
+  backend: "redis"
+  ttl: 3600  # 1 час
+  
+  # Кэшируемые объекты
+  cache_predictions: true
+  cache_preprocessed_data: true
+  cache_model_outputs: true
+
+# Логирование для продакшна
+production_logging:
+  structured_logs: true
+  log_format: "json"
+  
+  # Логирование запросов
+  request_logging:
+    enabled: true
+    include_payload: false  # Безопасность
+    include_response: true
+  
+  # Audit trail
+  audit:
+    enabled: true
+    log_predictions: true
+    log_model_changes: true
+    retention_period: "1y"

@@ -1,0 +1,109 @@
+# configs/gpu_optimized.yaml
+# Конфигурация для GPU оптимизации
+
+project:
+  name: "gpu_optimized_drought_prediction"
+  description: "GPU-optimized configuration for maximum performance"
+
+defaults:
+  - config
+
+# GPU-оптимизированные параметры обучения
+training:
+  batch_size: 128           # Большой batch для GPU
+  max_epochs: 200
+  learning_rate: 0.001
+  
+  # GPU-специфичные оптимизации
+  accumulate_grad_batches: 4
+  gradient_clip_val: 1.0
+  stochastic_weight_avg: true
+
+# Фокус на GPU-эффективных моделях
+models:
+  classical:
+    # Ограничиваем классические модели
+    random_forest:
+      enabled: true
+      n_estimators: 300
+    xgboost:
+      enabled: true
+      tree_method: "gpu_hist"  # GPU XGBoost
+      gpu_id: 0
+  
+  sota:
+    # Все SOTA модели включены
+    earthformer:
+      enabled: true
+      batch_size: 32
+      embed_dim: 512
+      num_layers: 8
+      use_checkpoint: true      # Gradient checkpointing
+      use_flash_attention: true # Если доступно
+    
+    convlstm:
+      enabled: true
+      hidden_dims: [128, 128, 64]
+      
+    tft:
+      enabled: true
+      hidden_size: 256
+      
+    unet:
+      enabled: true
+
+# Максимальная GPU утилизация
+compute:
+  accelerator: "gpu"
+  devices: [0]              # Указываем конкретную GPU
+  precision: 16             # Смешанная точность
+  
+  # Оптимизации памяти
+  max_memory_usage: 0.95
+  
+  # DataLoader для GPU
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 4
+
+# GPU performance
+performance:
+  compile_models: true       # PyTorch 2.0 compilation
+  mixed_precision: true
+  
+  # Оптимизация памяти GPU
+  gradient_checkpointing: true
+  activation_checkpointing: true
+  
+  # CUDA оптимизации
+  cuda_optimizations:
+    enabled: true
+    allow_tf32: true
+    benchmark: true
+    deterministic: false     # Отключаем для скорости
+
+# Профилирование GPU
+profiler:
+  enabled: true
+  type: "pytorch"
+  
+  # GPU метрики
+  profile_memory: true
+  profile_gpu_utilization: true
+  with_stack: true
+  
+  # Выходные данные
+  output_dir: "gpu_profiler_logs"
+  export_chrome_trace: true
+
+# Мониторинг GPU
+gpu_monitoring:
+  enabled: true
+  log_gpu_stats: true
+  log_memory_usage: true
+  log_utilization: true
+  
+  # Алерты
+  memory_threshold: 0.9
+  utilization_threshold: 0.8

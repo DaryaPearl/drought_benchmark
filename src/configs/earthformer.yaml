@@ -1,0 +1,258 @@
+# configs/earthformer.yaml
+# Специализированная конфигурация для EarthFormer модели
+
+# Наследуем базовую конфигурацию
+defaults:
+  - config
+
+# Переопределения для EarthFormer
+project:
+  name: "earthformer_drought_prediction"
+  experiment_type: "earthformer_deep_learning"
+
+# Данные оптимизированные для EarthFormer
+data:
+  # Пространственное разрешение для EarthFormer
+  spatial_resolution: 0.25  # градусы
+  temporal_resolution: "monthly"
+  
+  # Входные переменные (каналы)
+  input_variables:
+    - "precipitation"
+    - "temperature" 
+    - "ndvi"
+    - "soil_moisture"
+    - "potential_evaporation"
+  
+  # Целевая переменная
+  target_variable: "spi3"
+  
+  # Пространственный размер патчей
+  spatial_patch_size: [64, 64]  # lat, lon пикселей
+  
+  # Предобработка для EarthFormer
+  preprocessing:
+    normalize: true
+    clip_outliers: true
+    outlier_std_threshold: 3.0
+
+# Обучение специально для EarthFormer
+training:
+  sequence_length: 12        # Временных шагов в прошлое
+  prediction_horizon: 3      # Прогноз на 3 месяца вперед
+  
+  # Разделение данных
+  train_years: [2003, 2016]
+  val_years: [2017, 2019]
+  test_years: [2020, 2024]
+  
+  # Параметры обучения
+  batch_size: 16            # Меньше из-за большой модели
+  max_epochs: 150
+  learning_rate: 0.0001     # Меньше LR для стабильности
+  weight_decay: 0.01
+  
+  # Оптимизатор
+  optimizer: "adamw"
+  scheduler: "cosine_annealing"
+  warmup_epochs: 10
+  
+  # Регуляризация
+  dropout: 0.1
+  gradient_clip_val: 1.0
+  early_stopping_patience: 20
+
+# Конфигурация EarthFormer модели
+models:
+  # Отключаем все остальные модели
+  classical:
+    linear_regression:
+      enabled: false
+    ridge:
+      enabled: false
+    random_forest:
+      enabled: false
+    xgboost:
+      enabled: false
+    gradient_boosting:
+      enabled: false
+  
+  sota:
+    # Только EarthFormer
+    earthformer:
+      enabled: true
+      
+      # Архитектура
+      input_shape: [12, 5, 64, 64]  # [time, channels, height, width]
+      patch_size: [2, 4, 4]         # [temporal, spatial_h, spatial_w]
+      embed_dim: 512                # Размер эмбедингов
+      num_layers: 8                 # Количество transformer слоев
+      num_heads: 8                  # Головы внимания
+      mlp_ratio: 4.0               # Соотношение MLP
+      
+      # Выходные параметры
+      horizon: 3                    # Горизонт предсказания
+      num_classes: 1               # Регрессия
+      
+      # Регуляризация
+      dropout: 0.1
+      attention_dropout: 0.1
+      path_dropout: 0.1            # Stochastic depth
+      
+      # Позиционные энкодинги
+      pos_encoding_type: "learned"  # "learned", "sinusoidal"
+      
+      # Специфичные для EarthFormer параметры
+      use_checkpoint: true         # Gradient checkpointing для экономии памяти
+      use_flash_attention: false   # Flash attention (если доступно)
+    
+    # Отключаем остальные SOTA модели для фокуса на EarthFormer
+    convlstm:
+      enabled: false
+    tft:
+      enabled: false
+    unet:
+      enabled: false
+
+# Вычисления оптимизированные для EarthFormer
+compute:
+  accelerator: "gpu"              # Обязательно GPU для EarthFormer
+  devices: 1                      # Одна GPU
+  precision: 16                   # Смешанная точность для экономии памяти
+  
+  # DataLoader оптимизация
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  
+  # Память
+  max_memory_usage: 0.9
+
+# Расширенная валидация для EarthFormer
+evaluation:
+  metrics:
+    - "mae"
+    - "rmse" 
+    - "r2"
+    - "mape"
+    - "drought_classification_f1"
+    - "spatial_correlation"       # Пространственная корреляция
+    - "temporal_consistency"      # Временная согласованность
+  
+  # Специальные метрики для пространственно-временных данных
+  spatiotemporal_metrics:
+    - "structural_similarity"     # SSIM для пространственных карт
+    - "earth_mover_distance"     # EMD для распределений
+    - "pattern_correlation"      # Корреляция паттернов
+
+# Специальная визуализация для EarthFormer
+visualization:
+  plots:
+    dataset_overview: true
+    training_curves: true
+    attention_maps: true          # Карты внимания
+    prediction_sequences: true    # Последовательности предсказаний
+    spatial_error_maps: true     # Пространственные карты ошибок
+    temporal_evolution: true     # Временная эволюция
+  
+  # Параметры для attention visualization
+  attention_visualization:
+    save_attention_weights: true
+    num_samples: 10
+    attention_layers: [0, 3, 7]  # Какие слои визуализировать
+
+# Логирование для исследования
+logging:
+  level: "INFO"
+  
+  # TensorBoard с дополнительными метриками
+  tensorboard:
+    enabled: true
+    log_every_n_steps: 5
+    log_attention_weights: true
+    log_embedding_projections: true
+  
+  # Weights & Biases для отслеживания экспериментов
+  wandb:
+    enabled: true
+    project: "earthformer_drought"
+    tags: ["earthformer", "drought", "spatiotemporal"]
+    notes: "EarthFormer for agricultural drought prediction"
+
+# Сохранение результатов
+output:
+  save_predictions: true
+  save_models: true
+  save_attention_weights: true    # Важно для анализа
+  save_embeddings: true          # Для понимания представлений
+  
+  # Форматы
+  formats:
+    predictions: "netcdf"        # Удобно для пространственных данных
+    attention: "numpy"           # Для дальнейшего анализа
+    embeddings: "numpy"
+
+# Callbacks специально для EarthFormer
+callbacks:
+  model_checkpoint:
+    monitor: "val_loss"
+    mode: "min"
+    save_top_k: 3
+    save_last: true
+    filename: "earthformer-{epoch:02d}-{val_loss:.4f}"
+  
+  early_stopping:
+    monitor: "val_loss"
+    patience: 20
+    mode: "min"
+    min_delta: 0.0001
+  
+  learning_rate_monitor:
+    logging_interval: "epoch"
+  
+  # Специальный callback для EarthFormer
+  attention_logger:
+    enabled: true
+    log_frequency: 10
+    save_path: "attention_logs"
+
+# Профиль производительности
+performance:
+  compile_models: true           # PyTorch 2.0 compilation
+  mixed_precision: true
+  
+  # Оптимизация памяти
+  gradient_checkpointing: true
+  activation_checkpointing: true
+  
+  # Профилирование
+  profiler:
+    enabled: true
+    type: "advanced"
+    output_dir: "earthformer_profiler"
+    schedule_wait: 2
+    schedule_warmup: 2
+    schedule_active: 6
+
+# Эксперименты и ablation studies
+experiments:
+  # Ablation study компонентов
+  ablation:
+    enabled: false
+    components:
+      - "temporal_attention"
+      - "spatial_attention" 
+      - "positional_encoding"
+      - "patch_embedding"
+  
+  # Гиперпараметр поиск
+  hyperparameter_search:
+    enabled: false
+    method: "optuna"            # "random", "grid", "optuna"
+    n_trials: 50
+    parameters:
+      learning_rate: [0.00001, 0.001]
+      embed_dim: [256, 512, 768]
+      num_layers: [4, 6, 8, 12]
+      patch_size: [[2,4,4], [4,8,8], [1,2,2]]

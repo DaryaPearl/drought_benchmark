@@ -1,0 +1,81 @@
+# configs/cpu_only.yaml
+# Конфигурация для CPU-only обучения
+
+project:
+  name: "cpu_drought_prediction"
+  description: "CPU-optimized configuration"
+
+defaults:
+  - config
+
+# CPU-оптимизированные параметры
+training:
+  batch_size: 16            # Меньший batch для CPU
+  max_epochs: 50
+  learning_rate: 0.01       # Больший LR для компенсации
+  
+  # CPU-specific
+  accumulate_grad_batches: 8  # Эмулируем больший batch
+
+# Фокус на CPU-эффективных моделях
+models:
+  classical:
+    # Все классические модели эффективны на CPU
+    linear_regression:
+      enabled: true
+    ridge:
+      enabled: true
+    random_forest:
+      enabled: true
+      n_estimators: 500
+      n_jobs: -1            # Используем все CPU ядра
+    xgboost:
+      enabled: true
+      n_jobs: -1
+      tree_method: "hist"   # CPU-оптимизированный
+    gradient_boosting:
+      enabled: true
+  
+  sota:
+    # Ограничиваем SOTA модели
+    convlstm:
+      enabled: true
+      hidden_dims: [32, 32]  # Меньшие размеры для CPU
+    
+    # Отключаем тяжелые модели
+    earthformer:
+      enabled: false
+    tft:
+      enabled: false
+    unet:
+      enabled: false
+
+# CPU конфигурация
+compute:
+  accelerator: "cpu"
+  devices: 1
+  precision: 32             # Полная точность для CPU
+  
+  # CPU оптимизации
+  num_workers: 0            # Отключаем многопроцессность
+  persistent_workers: false
+  pin_memory: false
+
+# CPU performance
+performance:
+  compile_models: false     # Отключаем для CPU
+  mixed_precision: false
+  
+  # CPU-специфичные оптимизации
+  cpu_optimizations:
+    num_threads: -1         # Используем все доступные потоки
+    omp_num_threads: -1
+    mkl_num_threads: -1
+
+# Упрощенное логирование для CPU
+logging:
+  level: "INFO"
+  tensorboard:
+    enabled: false          # Экономим ресурсы
+  wandb:
+    enabled: false

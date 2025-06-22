@@ -1,0 +1,214 @@
+# configs/research.yaml  
+# Конфигурация для исследовательского режима
+
+project:
+  name: "drought_research_experiment"
+  description: "Полное исследование с максимальным качеством"
+
+defaults:
+  - config
+
+# Максимальные данные
+data:
+  # Все доступные годы
+  years_range: [2000, 2024]  # Расширенный диапазон
+  
+  # Все регионы
+  regions:
+    us_plains: [30, 50, -110, -85]      # Расширенные границы
+    br_cerrado: [-25, -2, -70, -40]
+    in_ganga: [20, 32, 70, 92]
+    ru_steppe: [48, 58, 35, 50]
+    eu_mediterranean: [35, 45, -10, 25]  # Дополнительный регион
+    au_murray: [-40, -30, 135, 150]     # Австралия
+  
+  # Максимальный набор переменных
+  input_variables:
+    - "precipitation"
+    - "temperature"
+    - "ndvi"
+    - "soil_moisture"
+    - "potential_evaporation"
+    - "surface_pressure"
+    - "relative_humidity"
+    - "wind_speed"
+    - "solar_radiation"
+  
+  # Все индексы засухи
+  drought_indices:
+    - "spi1"
+    - "spi3" 
+    - "spi6"
+    - "spi12"
+    - "spei1"
+    - "spei3"
+    - "spei6"
+    - "pdsi"
+    - "snepi"
+    - "standardized_soil_moisture"
+
+# Максимальное качество обучения
+training:
+  sequence_length: 24            # 2 года истории
+  prediction_horizon: 6          # 6 месяцев вперед
+  
+  batch_size: 64
+  max_epochs: 500
+  learning_rate: 0.0001
+  early_stopping_patience: 50
+  
+  # Продвинутые техники
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 2
+  stochastic_weight_avg: true
+
+# Все модели включены с оптимальными настройками
+models:
+  classical:
+    # Все классические модели включены
+    linear_regression:
+      enabled: true
+    ridge:
+      enabled: true
+      alpha: 10.0
+    lasso:
+      enabled: true
+      alpha: 0.1
+    random_forest:
+      enabled: true
+      n_estimators: 1000
+      max_depth: 30
+    xgboost:
+      enabled: true
+      n_estimators: 1500
+      learning_rate: 0.03
+      max_depth: 10
+    gradient_boosting:
+      enabled: true
+      n_estimators: 800
+      learning_rate: 0.05
+  
+  sota:
+    # Все SOTA модели с максимальными параметрами
+    earthformer:
+      enabled: true
+      embed_dim: 768
+      num_layers: 12
+      num_heads: 12
+      horizon: 6
+    
+    convlstm:
+      enabled: true
+      hidden_dims: [128, 128, 64, 32]
+      horizon: 6
+    
+    tft:
+      enabled: true
+      hidden_size: 256
+      num_heads: 8
+      num_encoder_steps: 24
+      num_decoder_steps: 6
+    
+    unet:
+      enabled: true
+      temporal_steps: 24
+      horizon: 6
+
+# Максимальная валидация
+evaluation:
+  metrics:
+    - "mae"
+    - "rmse"
+    - "r2"
+    - "mape"
+    - "drought_f1"
+    - "drought_precision"
+    - "drought_recall"
+    - "spatial_correlation"
+    - "temporal_consistency"
+    - "climatological_skill"
+  
+  cross_validation:
+    enabled: true
+    type: "spatiotemporal"
+    n_splits: 10
+    spatial_blocks: true
+    temporal_blocks: true
+
+# Полная визуализация
+visualization:
+  create_plots: true
+  plot_dpi: 600                  # Высокое качество
+  
+  plots:
+    dataset_overview: true
+    training_curves: true
+    model_comparison: true
+    predictions_analysis: true
+    spatial_maps: true
+    regional_analysis: true
+    attention_maps: true
+    feature_importance: true
+    error_analysis: true
+    climatology_comparison: true
+
+# Исследовательские функции
+research:
+  # Ablation studies
+  ablation_studies:
+    enabled: true
+    components:
+      - "input_variables"
+      - "sequence_length"
+      - "model_components"
+      - "preprocessing_steps"
+  
+  # Ensemble methods
+  ensemble:
+    enabled: true
+    methods: ["voting", "stacking", "blending"]
+    meta_learner: "linear_regression"
+  
+  # Uncertainty quantification
+  uncertainty:
+    enabled: true
+    methods: ["bootstrap", "dropout", "bayesian"]
+    n_samples: 100
+  
+  # Transfer learning
+  transfer_learning:
+    enabled: true
+    source_regions: ["us_plains", "eu_mediterranean"]
+    target_regions: ["ru_steppe", "au_murray"]
+
+# Максимальное логирование
+logging:
+  level: "DEBUG"
+  log_to_file: true
+  
+  tensorboard:
+    enabled: true
+    log_every_n_steps: 1
+    log_attention_weights: true
+    log_embedding_projections: true
+    log_model_architecture: true
+  
+  wandb:
+    enabled: true
+    project: "drought_research"
+    log_code: true
+    log_artifacts: true
+
+# Сохранение всего
+output:
+  save_predictions: true
+  save_models: true
+  save_embeddings: true
+  save_attention_weights: true
+  save_feature_importance: true
+  save_uncertainty_estimates: true
+  
+  formats:
+    predictions: ["netcdf", "zarr", "csv"]
+    models: ["pytorch", "onnx"]
+    analysis: ["pickle", "json"]

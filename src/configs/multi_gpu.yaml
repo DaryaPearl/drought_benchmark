@@ -1,0 +1,80 @@
+# configs/multi_gpu.yaml
+# Конфигурация для мульти-GPU обучения
+
+project:
+  name: "multi_gpu_drought_prediction"
+  description: "Distributed training across multiple GPUs"
+
+defaults:
+  - config
+
+# Distributed training параметры
+training:
+  batch_size: 256           # Общий batch размер
+  max_epochs: 100
+  
+  # Синхронизация между GPU
+  sync_batchnorm: true
+  
+  # Distributed-specific
+  find_unused_parameters: false
+  gradient_clip_val: 1.0
+
+# Только модели поддерживающие distributed training
+models:
+  classical:
+    # Классические модели не поддерживают multi-GPU
+    random_forest:
+      enabled: false
+    xgboost:
+      enabled: false
+  
+  sota:
+    # Все SOTA модели поддерживают distributed training
+    earthformer:
+      enabled: true
+      batch_size: 64         # Per-GPU batch size
+      
+    convlstm:
+      enabled: true
+      
+    tft:
+      enabled: true
+      
+    unet:
+      enabled: true
+
+# Multi-GPU конфигурация
+compute:
+  accelerator: "gpu"
+  devices: [0, 1, 2, 3]     # 4 GPU
+  strategy: "ddp"           # Distributed Data Parallel
+  precision: 16
+  
+  # Distributed settings
+  num_nodes: 1
+  sync_batchnorm: true
+  
+  # DataLoader для distributed
+  num_workers: 16           # 4 worker на GPU
+  persistent_workers: true
+
+# Distributed performance
+distributed:
+  backend: "nccl"           # Лучший для GPU
+  find_unused_parameters: false
+  
+  # Оптимизации коммуникации
+  bucket_cap_mb: 25
+  
+  # Gradient compression
+  compression:
+    enabled: false          # Отключаем для точности
+    
+# Checkpoint для distributed
+checkpointing:
+  # Только rank 0 сохраняет checkpoints
+  save_on_rank_zero_only: true
+  
+  # Более частое сохранение при distributed
+  every_n_epochs: 5

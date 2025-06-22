@@ -1,12 +1,65 @@
-pytorch-lightning>=2.2
-torchmetrics>=1.4
-scikit-learn>=1.4
-xgboost>=2.0
-lightgbm>=4.3
-earthformer
-pytorch-forecasting
-hydra-core>=1.3
-xarray 
-zarr 
-climate-indices 
-google-cloud-storage
+# Основные зависимости для системы предсказания засухи
+# Установка: pip install -r requirements.txt
+
+# Core ML/DL frameworks
+torch>=2.0.0
+pytorch-lightning>=2.0.0
+torchmetrics>=1.0.0
+
+# Data manipulation and analysis
+numpy>=1.24.0
+pandas>=2.0.0
+xarray>=2023.1.0
+scipy>=1.10.0
+
+# Climate and geospatial data
+zarr>=2.14.0
+netcdf4>=1.6.0
+rioxarray>=0.14.0
+climate-indices>=1.0.0
+
+# Machine Learning
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+catboost>=1.2.0
+
+# Deep Learning (optional SOTA models)
+pytorch-forecasting>=1.0.0  # For TFT
+# earthformer  # Install from source if available
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Configuration and logging
+hydra-core>=1.3.0
+pyyaml>=6.0
+tensorboard>=2.13.0
+wandb>=0.15.0  # optional
+
+# Data download and processing
+requests>=2.31.0
+tqdm>=4.65.0
+joblib>=1.3.0
+
+# Cloud and external APIs
+google-cloud-storage>=2.10.0  # optional
+cdsapi>=0.6.1  # for ERA5 data
+
+# Utilities
+pathlib-mate>=1.0.0  # optional
+python-dotenv>=1.0.0  # optional
+
+# Development and testing (optional)
+pytest>=7.4.0  # optional
+black>=23.0.0  # optional
+flake8>=6.0.0  # optional
+
+# System requirements
+psutil>=5.9.0  # for monitoring
+
+# Jupyter (optional, for notebooks)
+jupyter>=1.0.0  # optional
+ipywidgets>=8.0.0  # optional

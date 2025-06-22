@@ -1,0 +1,403 @@
+# Конфигурация проекта предсказания засухи
+# config.yaml
+
+project:
+  name: "agricultural_drought_prediction"
+  version: "2.0.0"
+  description: "ML/AI система для предсказания сельскохозяйственной засухи"
+  authors: ["Researcher", "Biologist", "Data Scientist"]
+
+# Настройки данных
+data:
+  # Временной диапазон
+  years_range: [2003, 2024]
+  
+  # Регионы интереса (lat_min, lat_max, lon_min, lon_max)
+  regions:
+    us_plains: [35, 48, -104, -90]      # США - Великие равнины
+    br_cerrado: [-20, -6, -62, -46]     # Бразилия - Серрадо
+    in_ganga: [21, 31, 73, 90]          # Индия - Ганг
+    ru_steppe: [50, 55, 37, 47]         # Россия - Центрально-Черноземный
+  
+  # Входные переменные
+  input_variables:
+    - "precipitation"        # Осадки (CHIRPS)
+    - "temperature"         # Температура (ERA5)
+    - "ndvi"               # Индекс растительности (MODIS)
+    - "soil_moisture"      # Влажность почвы (ERA5)
+    - "potential_evaporation"  # Потенциальное испарение
+  
+  # Индексы засухи
+  drought_indices:
+    - "spi1"   # SPI-1 месяц
+    - "spi3"   # SPI-3 месяца
+    - "spi6"   # SPI-6 месяцев
+    - "spei3"  # SPEI-3 месяца
+    - "pdsi"   # Palmer Drought Severity Index
+    - "snepi"  # Snow-Normalized Precipitation Index
+  
+  # Целевая переменная для предсказания
+  target_variable: "spi3"
+  
+  # Пути к данным
+  paths:
+    raw_data: "data/raw"
+    processed_data: "data/processed"
+    output_zarr: "data/processed/real_agro_cube.zarr"
+
+# Настройки обучения
+training:
+  # Временные окна
+  sequence_length: 12        # Длина входной последовательности (месяцы)
+  prediction_horizon: 3      # Горизонт предсказания (месяцы)
+  
+  # Разделение данных по годам
+  train_years: [2003, 2016]  # Обучающий набор
+  val_years: [2017, 2019]    # Валидационный набор
+  test_years: [2020, 2024]   # Тестовый набор
+  
+  # Параметры обучения
+  batch_size: 32
+  max_epochs: 100
+  early_stopping_patience: 15
+  learning_rate: 0.001
+  gradient_clip_val: 1.0
+  
+  # Аугментация данных
+  data_augmentation:
+    enabled: false
+    noise_std: 0.01
+    temporal_jitter: true
+
+# Конфигурации моделей
+models:
+  # Классические модели ML
+  classical:
+    linear_regression:
+      enabled: true
+    
+    ridge:
+      enabled: true
+      alpha: 1.0
+    
+    random_forest:
+      enabled: true
+      n_estimators: 500
+      max_depth: 20
+      random_state: 42
+      n_jobs: -1
+    
+    xgboost:
+      enabled: true
+      n_estimators: 800
+      learning_rate: 0.05
+      max_depth: 8
+      subsample: 0.8
+      colsample_bytree: 0.8
+      random_state: 42
+    
+    gradient_boosting:
+      enabled: true
+      n_estimators: 300
+      learning_rate: 0.1
+      max_depth: 6
+      random_state: 42
+  
+  # SOTA deep learning модели
+  sota:
+    earthformer:
+      enabled: true
+      input_shape: [12, 5, 64, 64]  # [time, channels, height, width]
+      patch_size: [2, 4, 4]
+      embed_dim: 384
+      num_layers: 6
+      num_heads: 8
+      horizon: 3
+      dropout: 0.1
+    
+    convlstm:
+      enabled: true
+      input_channels: 5
+      hidden_dims: [64, 64, 32]
+      kernel_size: 3
+      horizon: 3
+      dropout: 0.1
+    
+    tft:
+      enabled: true
+      input_size: 64
+      hidden_size: 128
+      num_heads: 4
+      num_encoder_steps: 12
+      num_decoder_steps: 3
+      dropout: 0.1
+    
+    unet:
+      enabled: true
+      input_channels: 5
+      output_channels: 1
+      temporal_steps: 12
+      horizon: 3
+
+# Настройки вычислений
+compute:
+  # PyTorch Lightning
+  accelerator: "auto"        # "cpu", "gpu", "tpu", "auto"
+  devices: "auto"           # Количество устройств
+  precision: 32             # 16, 32, 64
+  
+  # Параллелизация
+  num_workers: 4            # Для DataLoader
+  persistent_workers: true
+  
+  # Память
+  pin_memory: true
+  max_memory_usage: 0.8     # Максимальное использование GPU памяти
+
+# Настройки валидации и метрик
+evaluation:
+  # Основные метрики
+  metrics:
+    - "mae"          # Mean Absolute Error
+    - "rmse"         # Root Mean Square Error
+    - "r2"           # R-squared
+    - "mape"         # Mean Absolute Percentage Error
+    - "drought_f1"   # F1-score для классификации засухи
+  
+  # Пороги для классификации засухи (по SPI)
+  drought_thresholds:
+    no_drought: [-0.5, 0.5]      # Нормальные условия
+    mild_drought: [-1.0, -0.5]   # Слабая засуха
+    moderate_drought: [-1.5, -1.0]  # Умеренная засуха
+    severe_drought: [-2.0, -1.5]    # Сильная засуха
+    extreme_drought: [-10.0, -2.0]  # Экстремальная засуха
+  
+  # Кросс-валидация
+  cross_validation:
+    enabled: true
+    type: "time_series"       # "time_series", "spatial", "spatiotemporal"
+    n_splits: 5
+    test_size: 0.2
+
+# Настройки визуализации
+visualization:
+  # Создание графиков
+  create_plots: true
+  plot_dpi: 300
+  plot_format: "png"
+  
+  # Типы визуализаций
+  plots:
+    dataset_overview: true      # Обзор датасета
+    training_curves: true       # Кривые обучения
+    model_comparison: true      # Сравнение моделей
+    predictions_analysis: true  # Анализ предсказаний
+    spatial_maps: true         # Пространственные карты
+    regional_analysis: true    # Анализ по регионам
+  
+  # Стиль графиков
+  style:
+    theme: "seaborn-v0_8"
+    color_palette: "husl"
+    figure_size: [12, 8]
+    font_size: 12
+
+# Настройки логирования и мониторинга
+logging:
+  # Уровень логирования
+  level: "INFO"              # DEBUG, INFO, WARNING, ERROR
+  
+  # Файлы логов
+  log_to_file: true
+  log_file: "logs/experiment.log"
+  
+  # TensorBoard
+  tensorboard:
+    enabled: true
+    log_dir: "lightning_logs"
+    log_every_n_steps: 10
+  
+  # Weights & Biases (опционально)
+  wandb:
+    enabled: false
+    project: "drought_prediction"
+    entity: "your_username"
+
+# Настройки сохранения результатов
+output:
+  # Директории
+  results_dir: "results"
+  checkpoints_dir: "checkpoints"
+  predictions_dir: "predictions"
+  
+  # Что сохранять
+  save_predictions: true
+  save_models: true
+  save_embeddings: false
+  save_attention_weights: false
+  
+  # Форматы файлов
+  formats:
+    predictions: "netcdf"     # "netcdf", "zarr", "csv"
+    models: "pytorch"         # "pytorch", "onnx", "torchscript"
+    metrics: "json"          # "json", "yaml", "csv"
+
+# Настройки воспроизводимости
+reproducibility:
+  # Случайные семена
+  seed: 42
+  deterministic: true        # Детерминистичные операции
+  benchmark: false          # CuDNN benchmark
+  
+  # Сохранение конфигурации
+  save_config: true
+  config_file: "experiment_config.yaml"
+
+# Настройки API внешних сервисов
+external_apis:
+  # NASA Earthdata
+  earthdata:
+    username: null           # Будет взят из ~/.netrc или переменных окружения
+    password: null
+    
+  # Copernicus CDS (для ERA5)
+  copernicus_cds:
+    api_key: null           # Будет взят из ~/.cdsapirc
+    
+  # USGS (для Landsat/MODIS)
+  usgs:
+    username: null
+    password: null
+
+# Профили запуска для разных сценариев
+profiles:
+  # Быстрый тест
+  quick:
+    data:
+      years_range: [2020, 2022]
+      spatial_subset:
+        lat_min: 40
+        lat_max: 45
+        lon_min: -100
+        lon_max: -90
+    training:
+      max_epochs: 5
+      batch_size: 8
+    models:
+      classical:
+        random_forest:
+          n_estimators: 50
+      sota:
+        earthformer:
+          enabled: false
+        convlstm:
+          enabled: true
+  
+  # Полный эксперимент
+  full:
+    training:
+      max_epochs: 200
+      early_stopping_patience: 30
+    models:
+      classical:
+        enabled: true
+      sota:
+        enabled: true
+  
+  # Только классические модели
+  classical_only:
+    models:
+      sota:
+        earthformer:
+          enabled: false
+        convlstm:
+          enabled: false
+        tft:
+          enabled: false
+        unet:
+          enabled: false
+  
+  # Исследовательский режим
+  research:
+    training:
+      max_epochs: 500
+      learning_rate: 0.0001
+    evaluation:
+      cross_validation:
+        enabled: true
+        n_splits: 10
+    output:
+      save_embeddings: true
+      save_attention_weights: true
+
+# Настройки оптимизации производительности
+performance:
+  # Компиляция моделей
+  compile_models: false      # PyTorch 2.0 compile
+  
+  # Смешанная точность
+  mixed_precision: true      # Автоматическая смешанная точность
+  
+  # Оптимизация DataLoader
+  prefetch_factor: 2
+  persistent_workers: true
+  
+  # Профилирование
+  profiler:
+    enabled: false
+    type: "simple"          # "simple", "advanced", "pytorch"
+    output_dir: "profiler_logs"
+
+# Настройки безопасности
+security:
+  # Проверка данных
+  validate_inputs: true
+  sanitize_paths: true
+  
+  # Ограничения ресурсов
+  max_memory_gb: 32
+  max_training_hours: 24
+  
+  # Логирование безопасности
+  audit_log: true
+  audit_file: "logs/audit.log"
+
+# Настройки интеграции и развертывания
+deployment:
+  # Docker
+  docker:
+    enabled: false
+    base_image: "pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime"
+    requirements_file: "requirements.txt"
+  
+  # API сервис
+  api:
+    enabled: false
+    host: "0.0.0.0"
+    port: 8000
+    workers: 4
+  
+  # Мониторинг
+  monitoring:
+    enabled: false
+    metrics_port: 9090
+    health_check_interval: 30
+
+# Экспериментальные функции
+experimental:
+  # Федеративное обучение
+  federated_learning:
+    enabled: false
+    num_clients: 4
+    rounds: 10
+  
+  # Объяснимость моделей
+  explainability:
+    enabled: false
+    methods: ["shap", "lime", "gradcam"]
+  
+  # Активное обучение
+  active_learning:
+    enabled: false
+    strategy: "uncertainty"
+    budget: 1000
