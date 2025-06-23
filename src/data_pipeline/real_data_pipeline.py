@@ -20,7 +20,7 @@ import tempfile
 import requests
 import warnings
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Any
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -32,6 +32,13 @@ from scipy.stats import gamma, norm
 import rioxarray as rio
 from netrc import netrc
 import h5py
+
+try:
+    from .modis_gee_downloader import MODISGEEDownloader
+    MODIS_GEE_AVAILABLE = True
+except ImportError:
+    MODIS_GEE_AVAILABLE = False
+    print("⚠ Google Earth Engine не настроен. Будут созданы климатические NDVI данные")
 
 # Настройки
 YEARS = range(2003, 2025)
@@ -278,20 +285,43 @@ class MODISDownloader:
     
     @staticmethod
     def download_modis_ndvi(dest_dir: Path) -> xr.Dataset:
-        """Загрузка MODIS NDVI"""
-        print("🛰 Попытка загрузки MODIS NDVI...")
+        """Загрузка MODIS NDVI - сначала пробуем реальные данные через GEE"""
+        print("🛰 Загрузка MODIS NDVI данных...")
         
+        # Пробуем загрузить реальные данные через Google Earth Engine
+        if MODIS_GEE_AVAILABLE:
+            try:
+                print("🌍 Попытка загрузки реальных MODIS данных через Google Earth Engine...")
+                
+                # Замените на ваш Google Cloud Project ID
+                PROJECT_ID = "your-project-id"  # TODO: Установите ваш Project ID
+                
+                downloader = MODISGEEDownloader(project_id=PROJECT_ID)
+                modis_ds = downloader.download_modis_ndvi_real(
+                    output_file=str(dest_dir / "modis_ndvi_real.nc")
+                )
+                
+                print("✅ Реальные MODIS данные успешно загружены!")
+                return modis_ds
+                
+            except Exception as e:
+                print(f"⚠ Ошибка загрузки реальных MODIS данных: {e}")
+                print("📊 Переходим к созданию климатических NDVI данных...")
+                # Продолжаем с климатическими данными
+        
+        # Если GEE недоступен или произошла ошибка - создаем климатические данные
         try:
             username, password = MODISDownloader.setup_earthdata_auth()
         except:
-            print("⚠ Используем упрощенные NDVI данные")
-            return MODISDownloader._create_simplified_ndvi()
+            print("⚠ Используем климатически обоснованные NDVI данные")
+            return MODISDownloader._create_climate_based_ndvi()
         
-        # Здесь был бы код для реальной загрузки MODIS
+        # Здесь был бы код для реальной загрузки MODIS через NASA
         # Но это очень сложно без специальных библиотек
-        print("📊 Генерация реалистичных NDVI данных на основе климата...")
+        print("📊 Генерация климатически реалистичных NDVI данных...")
         return MODISDownloader._create_climate_based_ndvi()
-    
+
+
     @staticmethod
     def _create_climate_based_ndvi() -> xr.Dataset:
         """Создание климатически обоснованных NDVI данных"""
@@ -936,5 +966,30 @@ def main():
         print(f"\n❌ Ошибка: {e}")
         raise
 
+def setup_google_earth_engine():
+    """Помощник для настройки Google Earth Engine"""
+    print("🌍 Настройка Google Earth Engine для реальных MODIS данных")
+    print("=" * 60)
+    
+    print("📋 Шаги для настройки:")
+    print("1. Зарегистрируйтесь на https://earthengine.google.com/")
+    print("2. Создайте Google Cloud Project на https://console.cloud.google.com/")
+    print("3. Включите Earth Engine API для вашего проекта")
+    print("4. Установите библиотеки:")
+    print("   pip install earthengine-api geemap")
+    print("5. Выполните аутентификацию:")
+    print("   earthengine authenticate")
+    print("6. Обновите PROJECT_ID в файле modis_gee_downloader.py")
+    
+    print("\n💡 После настройки ваш pipeline будет использовать:")
+    print("  ✅ Реальные CHIRPS данные (осадки + SPI)")
+    print("  ✅ Реальные ERA5 данные (температура, влажность)")  
+    print("  ✅ Реальные MODIS данные (NDVI, EVI)")
+    print("  🎯 100% реальный датасет!")
+
 if __name__ == "__main__":
-    main()
+    # Добавьте в конец main() функции:
+    if "--setup-gee" in sys.argv:
+        setup_google_earth_engine()
+    else:
+        main()

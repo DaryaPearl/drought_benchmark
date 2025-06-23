@@ -61,7 +61,7 @@ class ProjectRunner:
         # Проверка основных зависимостей
         required_packages = [
             'numpy', 'pandas', 'xarray', 'torch', 'pytorch_lightning',
-            'scikit-learn', 'matplotlib', 'requests'
+            'sklearn', 'matplotlib', 'requests'
         ]
         
         missing_packages = []
@@ -169,38 +169,70 @@ class ProjectRunner:
         print("📦 ЭТАП 1: СБОРКА ДАННЫХ")
         print("="*60)
         
-        data_script = self.project_root / "src" / "data_pipeline" / "real_data_pipeline.py"
-        
-        if not data_script.exists():
-            print(f"❌ Скрипт сборки данных не найден: {data_script}")
-            return False
-        
-        try:
-            print("🚀 Запуск сборки реального датасета...")
+        # В быстром режиме используем упрощенный pipeline
+        if quick_mode:
+            print("⚡ Быстрый режим: создание синтетических данных...")
             
-            # Добавляем переменные окружения для быстрого режима
-            env = os.environ.copy()
-            if quick_mode:
-                env['QUICK_MODE'] = '1'
-                print("⚡ Включен быстрый режим сборки данных")
-            
-            result = subprocess.run([
-                sys.executable, "-m", "src.data_pipeline.real_data_pipeline"
-            ], cwd=self.project_root, env=env, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print("✅ Сборка данных завершена успешно")
-                print(result.stdout)
+            # Проверяем, есть ли уже данные
+            data_path = Path("data/processed/real_agro_cube.zarr")
+            if data_path.exists():
+                print("📁 Данные уже существуют, пропускаем создание")
                 return True
-            else:
-                print("❌ Ошибка при сборке данных:")
-                print(result.stderr)
-                return False
+            
+            try:
+                # Запускаем быстрый pipeline
+                result = subprocess.run([
+                    sys.executable, "-m", "src.data_pipeline.quick_data_pipeline"
+                ], cwd=self.project_root, capture_output=True, text=True, timeout=60)
                 
-        except Exception as e:
-            print(f"❌ Исключение при сборке данных: {e}")
-            return False
-    
+                if result.returncode == 0:
+                    print("✅ Синтетические данные созданы успешно")
+                    print(result.stdout)
+                    return True
+                else:
+                    print("❌ Ошибка при создании синтетических данных:")
+                    print(result.stderr)
+                    return False
+                    
+            except subprocess.TimeoutExpired:
+                print("⏱ Таймаут при создании данных")
+                return False
+            except Exception as e:
+                print(f"❌ Исключение при создании данных: {e}")
+                return False
+        
+        # Обычный режим - полный pipeline
+        else:
+            data_script = self.project_root / "src" / "data_pipeline" / "real_data_pipeline.py"
+            
+            if not data_script.exists():
+                print(f"❌ Скрипт сборки данных не найден: {data_script}")
+                return False
+            
+            try:
+                print("🚀 Запуск полного pipeline сборки данных...")
+                
+                env = os.environ.copy()
+                if quick_mode:
+                    env['QUICK_MODE'] = '1'
+                
+                result = subprocess.run([
+                    sys.executable, "-m", "src.data_pipeline.real_data_pipeline"
+                ], cwd=self.project_root, env=env, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    print("✅ Сборка данных завершена успешно")
+                    print(result.stdout)
+                    return True
+                else:
+                    print("❌ Ошибка при сборке данных:")
+                    print(result.stderr)
+                    return False
+                    
+            except Exception as e:
+                print(f"❌ Исключение при сборке данных: {e}")
+                return False
+
     def run_training_pipeline(self, models: List[str], quick_mode: bool = False) -> bool:
         """Запуск пайплайна обучения"""
         print("\n" + "="*60)

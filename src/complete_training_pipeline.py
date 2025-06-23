@@ -33,10 +33,18 @@ from sklearn.model_selection import TimeSeriesSplit
 import xarray as xr
 from torch.utils.data import DataLoader, Dataset
 
-# Локальные импорты (предполагаем, что файлы созданы)
-from src.models.sota_models import get_model, CONFIGS
-from src.utils.metrics import DroughtMetrics
-from src.utils.visualization import ResultsVisualizer, TrainingVisualizer
+try:
+    from .models.sota_models import get_model, CONFIGS
+    from .utils.metrics import DroughtMetrics
+    from .utils.visualization import ResultsVisualizer, TrainingVisualizer
+except ImportError:
+    # Fallback для запуска как скрипт
+    import sys
+    from pathlib import Path
+    sys.path.append(str(Path(__file__).parent.parent))
+    from src.models.sota_models import get_model, CONFIGS
+    from src.utils.metrics import DroughtMetrics
+    from src.utils.visualization import ResultsVisualizer, TrainingVisualizer
 
 warnings.filterwarnings("ignore")
 
@@ -72,52 +80,124 @@ class DroughtDataset(Dataset):
         # Подготовка данных
         self._prepare_sequences()
     
+# Найдите в src/complete_training_pipeline.py метод _prepare_sequences 
+# и замените его на эту более устойчивую версию:
+
     def _prepare_sequences(self):
-        """Подготовка последовательностей для обучения"""
+        """Устойчивая подготовка последовательностей для обучения"""
         print(f"📊 Подготовка последовательностей (окно={self.sequence_length}, горизонт={self.prediction_horizon})")
+        
+        # Проверяем доступность переменных
+        available_vars = [var for var in self.input_vars if var in self.data.data_vars]
+        if not available_vars:
+            raise ValueError(f"Нет доступных входных переменных из {self.input_vars}")
+        
+        if self.target_var not in self.data.data_vars:
+            raise ValueError(f"Целевая переменная {self.target_var} не найдена")
+        
+        print(f"📋 Используемые переменные: {available_vars}")
         
         # Конвертация в numpy
         input_data = []
-        for var in self.input_vars:
-            if var in self.data.data_vars:
-                input_data.append(self.data[var].values)
+        for var in available_vars:
+            var_data = self.data[var].values  # (time, lat, lon)
+            print(f"  {var}: форма {var_data.shape}, NaN: {np.isnan(var_data).sum()}")
+            input_data.append(var_data)
         
-        input_array = np.stack(input_data, axis=1)  # (time, variables, lat, lon)
+        # Объединение: (time, variables, lat, lon)
+        input_array = np.stack(input_data, axis=1)  
         target_array = self.data[self.target_var].values  # (time, lat, lon)
         
-        # Создание последовательностей
+        print(f"📐 Объединенные входные данные: {input_array.shape}")
+        print(f"📐 Целевые данные: {target_array.shape}")
+        
+        # Проверяем общее количество NaN
+        total_input_nan = np.isnan(input_array).sum()
+        total_target_nan = np.isnan(target_array).sum()
+        print(f"🔍 NaN в входных данных: {total_input_nan}")
+        print(f"🔍 NaN в целевых данных: {total_target_nan}")
+        
+        # Создание последовательностей - упрощенный подход
         self.sequences = []
         self.targets = []
         
-        T = input_array.shape[0]
-        for t in range(self.sequence_length, T - self.prediction_horizon):
-            # Входная последовательность
-            seq = input_array[t - self.sequence_length:t]
-            
-            # Целевые значения (через prediction_horizon шагов)
-            target_time_indices = range(t, t + self.prediction_horizon)
-            target = target_array[target_time_indices]
-            
-            # Проверка на NaN
-            if not (np.isnan(seq).any() or np.isnan(target).any()):
-                self.sequences.append(seq)
-                self.targets.append(target)
+        T, n_vars, H, W = input_array.shape
+        print(f"📊 Размеры для обработки: T={T}, vars={n_vars}, H={H}, W={W}")
         
-        self.sequences = np.array(self.sequences)
-        self.targets = np.array(self.targets)
+        # Вместо обработки по пикселям, работаем с пространственными средними
+        for t in range(self.sequence_length, T - self.prediction_horizon + 1):
+            # Входная последовательность: среднее по пространству
+            seq_means = []
+            for time_step in range(t - self.sequence_length, t):
+                # Для каждого временного шага берем среднее по пространству для каждой переменной
+                step_means = []
+                for var_idx in range(n_vars):
+                    spatial_mean = np.nanmean(input_array[time_step, var_idx, :, :])
+                    # Заменяем NaN на 0
+                    if np.isnan(spatial_mean):
+                        spatial_mean = 0.0
+                    step_means.append(spatial_mean)
+                seq_means.extend(step_means)  # Flatten временные шаги и переменные
+            
+            # Целевое значение: среднее по пространству и времени
+            target_means = []
+            for future_step in range(t, t + self.prediction_horizon):
+                target_spatial_mean = np.nanmean(target_array[future_step, :, :])
+                if np.isnan(target_spatial_mean):
+                    target_spatial_mean = 0.0
+                target_means.append(target_spatial_mean)
+            
+            # Среднее по горизонту предсказания
+            target_final = np.mean(target_means)
+            
+            # Проверяем что нет NaN
+            if not (np.isnan(seq_means).any() or np.isnan(target_final)):
+                self.sequences.append(seq_means)
+                self.targets.append(target_final)
         
-        print(f"✅ Создано {len(self.sequences)} последовательностей")
-        print(f"📐 Форма входа: {self.sequences.shape}")
-        print(f"📐 Форма цели: {self.targets.shape}")
-    
-    def __len__(self):
-        return len(self.sequences)
-    
-    def __getitem__(self, idx):
-        return (
-            torch.FloatTensor(self.sequences[idx]),
-            torch.FloatTensor(self.targets[idx])
-        )
+        if not self.sequences:
+            # Если не получилось создать последовательности, попробуем более простой подход
+            print("⚠ Не удалось создать последовательности стандартным способом, пробуем упрощенный...")
+            
+            # Очень простой подход: берем глобальные средние
+            for t in range(self.sequence_length, min(T - self.prediction_horizon + 1, T - 1)):
+                # Простая последовательность средних значений
+                simple_seq = []
+                for time_step in range(t - self.sequence_length, t):
+                    for var_idx in range(n_vars):
+                        val = np.nanmean(input_array[time_step, var_idx, :, :])
+                        simple_seq.append(0.0 if np.isnan(val) else val)
+                
+                # Простая цель
+                target_val = np.nanmean(target_array[t, :, :])
+                target_val = 0.0 if np.isnan(target_val) else target_val
+                
+                self.sequences.append(simple_seq)
+                self.targets.append(target_val)
+        
+        if not self.sequences:
+            raise ValueError("Не удалось создать валидные последовательности даже упрощенным способом")
+        
+        # Конвертация в numpy массивы
+        self.sequences = np.array(self.sequences)  # (n_samples, features)
+        self.targets = np.array(self.targets)      # (n_samples,)
+        
+        print(f"✅ Создано {len(self.sequences)} валидных последовательностей")
+        print(f"📐 Финальная форма входа: {self.sequences.shape}")
+        print(f"📐 Финальная форма цели: {self.targets.shape}")
+        
+        # Финальная проверка на NaN
+        input_nans = np.isnan(self.sequences).sum()
+        target_nans = np.isnan(self.targets).sum()
+        
+        if input_nans > 0:
+            print(f"🔧 Заменяем {input_nans} NaN в входных данных на 0")
+            self.sequences[np.isnan(self.sequences)] = 0.0
+        
+        if target_nans > 0:
+            print(f"🔧 Заменяем {target_nans} NaN в целевых данных на 0")
+            self.targets[np.isnan(self.targets)] = 0.0
+
 
 class ClassicalModelsTrainer:
     """Тренер для классических моделей ML"""
@@ -154,36 +234,18 @@ class ClassicalModelsTrainer:
         """Подготовка данных для классических моделей"""
         print("🔄 Подготовка данных для классических моделей...")
         
-        # Преобразование последовательностей в плоские признаки
-        sequences = dataset.sequences  # (samples, time, vars, lat, lon)
-        targets = dataset.targets     # (samples, horizon, lat, lon)
+        # Данные уже подготовлены в dataset._prepare_sequences()
+        sequences = dataset.sequences  # (n_samples, seq_len, vars)
+        targets = dataset.targets     # (n_samples,)
         
-        # Flatten пространственных измерений и создание лагов
-        n_samples, seq_len, n_vars, n_lat, n_lon = sequences.shape
+        print(f"📊 Форма последовательностей: {sequences.shape}")
+        print(f"📊 Форма целей: {targets.shape}")
         
-        # Создание признаков: каждый пиксель и временной шаг становится признаком
-        features = []
-        labels = []
-        
-        for sample_idx in range(n_samples):
-            seq = sequences[sample_idx]  # (time, vars, lat, lon)
-            target = targets[sample_idx]  # (horizon, lat, lon)
-            
-            # Для каждого пикселя
-            for i in range(n_lat):
-                for j in range(n_lon):
-                    # Признаки: временные ряды всех переменных для данного пикселя
-                    pixel_features = seq[:, :, i, j].flatten()  # (time * vars,)
-                    
-                    # Целевые значения: средний SPI по горизонту для данного пикселя
-                    pixel_target = target[:, i, j].mean()  # Среднее по горизонту
-                    
-                    if not (np.isnan(pixel_features).any() or np.isnan(pixel_target)):
-                        features.append(pixel_features)
-                        labels.append(pixel_target)
-        
-        X = np.array(features)
-        y = np.array(labels)
+        # Преобразование в плоские признаки для классических моделей
+        # Flatten temporal and variable dimensions
+        n_samples, seq_len, n_vars = sequences.shape
+        X = sequences.reshape(n_samples, seq_len * n_vars)  # (n_samples, seq_len * vars)
+        y = targets
         
         print(f"📊 Классические данные: X={X.shape}, y={y.shape}")
         
