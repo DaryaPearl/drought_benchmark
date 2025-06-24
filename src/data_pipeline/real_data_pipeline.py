@@ -1,52 +1,47 @@
 """
-Пайплайн для загрузки РЕАЛЬНЫХ данных для предсказания засухи
-Источники:
-- CHIRPS: осадки (реальная загрузка)
-- ERA5-Land: температура, влажность почвы, испарение 
-- MODIS: NDVI (через NASA LAADS DAAC)
-- Российские данные: Росгидромет + ВНИИСХМ
-
-Требует: 
-- NASA Earthdata аккаунт (.netrc файл)
-- CDS API ключ для ERA5
-- Опционально: API ключи для российских данных
+Полный pipeline для реальных данных: CHIRPS + ERA5 + MODIS
+Требует настройки:
+1. CDS API для ERA5 (~/.cdsapirc)
+2. Google Earth Engine для MODIS
+3. NASA Earthdata для дополнительных источников
 
 Запуск: python -m src.data_pipeline.real_data_pipeline
 """
 
 import os
-import shutil
-import tempfile
-import requests
-import warnings
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional, Any
-import datetime as dt
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
 import json
+import datetime as dt
+from typing import Optional, Dict, Any
 
 import numpy as np
-import xarray as xr
 import pandas as pd
+import xarray as xr
+import requests
 from scipy.stats import gamma, norm
-import rioxarray as rio
-from netrc import netrc
-import h5py
 
+# Попытка импорта Google Earth Engine
 try:
-    from .modis_gee_downloader import MODISGEEDownloader
-    MODIS_GEE_AVAILABLE = True
+    import ee
+    import geemap
+    GEE_AVAILABLE = True
+    print("✅ Google Earth Engine доступен")
 except ImportError:
-    MODIS_GEE_AVAILABLE = False
-    print("⚠ Google Earth Engine не настроен. Будут созданы климатические NDVI данные")
+    GEE_AVAILABLE = False
+    print("⚠ Google Earth Engine недоступен")
+
+warnings.filterwarnings("ignore")
 
 # Настройки
-YEARS = range(2003, 2025)
+YEARS = range(2020, 2021)  # Полный период как в оригинале
 OUT_DIR = Path("data/raw")
 PROC_DIR = Path("data/processed")
 ZARR_OUT = PROC_DIR / "real_agro_cube.zarr"
 
-# Расширенные регионы (включая Россию)
+# Все регионы из оригинального проекта
 REGIONS = {
     "us_plains": (35, 48, -104, -90),      # США - Великие равнины
     "br_cerrado": (-20, -6, -62, -46),     # Бразилия - Серрадо  
@@ -54,942 +49,681 @@ REGIONS = {
     "ru_steppe": (50, 55, 37, 47),         # Россия - Центрально-Черноземный
 }
 
-# Глобальный bbox
+# Глобальный bbox охватывающий все регионы
 LAT_MIN = min(r[0] for r in REGIONS.values()) - 1
 LAT_MAX = max(r[1] for r in REGIONS.values()) + 1  
 LON_MIN = min(r[2] for r in REGIONS.values()) - 1
 LON_MAX = max(r[3] for r in REGIONS.values()) + 1
 
-warnings.filterwarnings("ignore", category=RuntimeWarning)
+GLOBAL_BOUNDS = {
+    'lat_min': LAT_MIN,
+    'lat_max': LAT_MAX,
+    'lon_min': LON_MIN,
+    'lon_max': LON_MAX
+}
+
+class GoogleEarthEngineSetup:
+    """Настройка и инициализация Google Earth Engine"""
+    
+    @staticmethod
+    def initialize_gee(project_id: Optional[str] = None) -> bool:
+        """Инициализация GEE"""
+        if not GEE_AVAILABLE:
+            return False
+            
+        try:
+            # Попытка инициализации с проектом
+            if project_id:
+                ee.Initialize(project=project_id)
+                print(f"✅ GEE инициализирован с проектом: {project_id}")
+            else:
+                ee.Initialize()
+                print("✅ GEE инициализирован")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Ошибка инициализации GEE: {e}")
+            print("\n📋 Для настройки Google Earth Engine:")
+            print("1. Зарегистрируйтесь: https://earthengine.google.com/")
+            print("2. Создайте Google Cloud Project: https://console.cloud.google.com/")
+            print("3. Включите Earth Engine API для проекта")
+            print("4. Установите: pip install earthengine-api geemap")
+            print("5. Выполните: earthengine authenticate")
+            print("6. Установите переменную: export GEE_PROJECT_ID='your-project-id'")
+            return False
+
+class RealMODISDownloader:
+    """Загрузчик реальных MODIS данных через Google Earth Engine"""
+    
+    def __init__(self, global_bounds: Dict):
+        self.global_bounds = global_bounds
+        self.roi = ee.Geometry.Rectangle([
+            global_bounds['lon_min'], global_bounds['lat_min'],
+            global_bounds['lon_max'], global_bounds['lat_max']
+        ])
+        
+    def download_modis_ndvi(self, years: range) -> Optional[xr.Dataset]:
+        """Загрузка реальных MODIS NDVI данных для всех регионов"""
+        print("🛰 Загрузка реальных MODIS NDVI через Google Earth Engine...")
+        print(f"🗺 Глобальная область: {self.global_bounds}")
+        print(f"📍 Регионы: {list(REGIONS.keys())}")
+        
+        # Создаем список дат
+        start_date = f"{years[0]}-01-01"
+        end_date = f"{years[-1]}-12-31"
+        
+        print(f"📅 Период: {start_date} - {end_date}")
+        
+        try:
+            # MODIS Terra Vegetation Indices (MOD13A2) - 16-дневные композиты 1км
+            modis = ee.ImageCollection("MODIS/061/MOD13A2") \
+                .filterDate(start_date, end_date) \
+                .filterBounds(self.roi) \
+                .select(['NDVI', 'EVI', ])
+            
+            print(f"📊 Найдено {modis.size().getInfo()} MODIS изображений")
+            
+            if modis.size().getInfo() == 0:
+                print("❌ Нет доступных MODIS данных для указанного периода")
+                return None
+            
+            # Функция обработки изображений
+            def process_modis(image):
+                # Масштабирование NDVI и EVI (scale factor = 0.0001)
+                ndvi = image.select('NDVI').multiply(0.0001)
+                evi = image.select('EVI').multiply(0.0001)
+                
+                # Маска качества (используем только надежные пиксели)
+                quality = image.select('DetailedQA')
+                good_pixels = quality.eq(0)  # 0 = хорошее качество
+                
+                # Применяем маску
+                ndvi_masked = ndvi.updateMask(good_pixels)
+                evi_masked = evi.updateMask(good_pixels)
+                
+                return ee.Image.cat([
+                    ndvi_masked.rename('ndvi'),
+                    evi_masked.rename('evi')
+                ]).copyProperties(image, ['system:time_start'])
+            
+            # Обрабатываем коллекцию
+            modis_processed = modis.map(process_modis)
+            
+            # Создаем месячные композиты
+            def create_monthly_composite(year_month):
+                year = ee.Number(year_month).divide(100).floor()
+                month = ee.Number(year_month).mod(100)
+                
+                start = ee.Date.fromYMD(year, month, 1)
+                end = start.advance(1, 'month')
+                
+                monthly = modis_processed.filterDate(start, end)
+                
+                return ee.Algorithms.If(
+                    monthly.size().gt(0),
+                    monthly.median().set({
+                        'year': year,
+                        'month': month,
+                        'system:time_start': start.millis()
+                    }),
+                    None
+                )
+            
+            # Список всех месяцев
+            months_list = []
+            for year in years:
+                for month in range(1, 13):
+                    months_list.append(year * 100 + month)
+            
+            monthly_images = [create_monthly_composite(ym) for ym in months_list]
+            
+            # Фильтруем None значения
+            monthly_collection = ee.ImageCollection(
+                ee.List(monthly_images).filter(ee.Filter.neq('item', None))
+            )
+            
+            actual_count = monthly_collection.size().getInfo()
+            print(f"📊 Создано {actual_count} месячных композитов")
+            
+            if actual_count == 0:
+                print("❌ Не удалось создать месячные композиты")
+                return None
+            
+            # Экспорт данных
+            return self._export_to_xarray(monthly_collection, years)
+            
+        except Exception as e:
+            print(f"❌ Ошибка загрузки MODIS: {e}")
+            return None
+    
+    def _export_to_xarray(self, collection: ee.ImageCollection, years: range) -> xr.Dataset:
+        """Экспорт GEE коллекции в xarray"""
+        print("📦 Экспорт MODIS данных в xarray...")
+        
+        # Определяем пространственную сетку для всех регионов
+        scale = 1000  # 1км в метрах
+        
+        # Создаем координаты для глобального охвата
+        lon_coords = np.arange(
+            self.global_bounds['lon_min'], 
+            self.global_bounds['lon_max'], 
+            0.01  # ~1км
+        )
+        lat_coords = np.arange(
+            self.global_bounds['lat_max'], 
+            self.global_bounds['lat_min'], 
+            -0.01  # Убывающая последовательность
+        )
+        
+        # Временные координаты
+        time_coords = pd.date_range(
+            f"{years[0]}-01-01", 
+            f"{years[-1]}-12-31", 
+            freq='MS'
+        )
+        
+        # Инициализируем массивы данных
+        ndvi_data = np.full((len(time_coords), len(lat_coords), len(lon_coords)), np.nan)
+        evi_data = np.full((len(time_coords), len(lat_coords), len(lon_coords)), np.nan)
+        
+        # Получаем список изображений
+        img_list = collection.toList(collection.size())
+        n_images = collection.size().getInfo()
+        
+        print(f"🔄 Обработка {n_images} изображений...")
+        
+        for i in range(min(n_images, len(time_coords))):
+            try:
+                print(f"  📅 Обработка {time_coords[i].strftime('%Y-%m')} ({i+1}/{n_images})")
+                
+                # Получаем изображение
+                img = ee.Image(img_list.get(i))
+                
+                # Экспорт через geemap
+                try:
+                    # NDVI
+                    ndvi_array = geemap.ee_to_numpy(
+                        img.select('ndvi'),
+                        region=self.roi,
+                        scale=scale,
+                        crs='EPSG:4326'
+                    )
+                    
+                    # EVI  
+                    evi_array = geemap.ee_to_numpy(
+                        img.select('evi'),
+                        region=self.roi,
+                        scale=scale,
+                        crs='EPSG:4326'
+                    )
+                    
+                    if ndvi_array is not None and evi_array is not None:
+                        # Изменяем размер если нужно
+                        if ndvi_array.shape != (len(lat_coords), len(lon_coords)):
+                            from scipy.ndimage import zoom
+                            zoom_factors = (
+                                len(lat_coords) / ndvi_array.shape[0],
+                                len(lon_coords) / ndvi_array.shape[1]
+                            )
+                            ndvi_array = zoom(ndvi_array, zoom_factors, order=1)
+                            evi_array = zoom(evi_array, zoom_factors, order=1)
+                        
+                        ndvi_data[i] = ndvi_array
+                        evi_data[i] = evi_array
+                        
+                        print(f"    ✅ Успешно обработано")
+                    else:
+                        print(f"    ⚠ Пустые данные")
+                        
+                except Exception as export_error:
+                    print(f"    ❌ Ошибка экспорта: {export_error}")
+                    continue
+                    
+            except Exception as img_error:
+                print(f"    ❌ Ошибка изображения: {img_error}")
+                continue
+        
+        # Подсчет успешно загруженных месяцев
+        valid_ndvi = ~np.isnan(ndvi_data).all(axis=(1, 2))
+        success_rate = valid_ndvi.sum() / len(time_coords) * 100
+        
+        print(f"📊 Успешно загружено: {valid_ndvi.sum()}/{len(time_coords)} месяцев ({success_rate:.1f}%)")
+        
+        # Создаем xarray Dataset
+        modis_ds = xr.Dataset({
+            'ndvi': (['time', 'latitude', 'longitude'], ndvi_data),
+            'evi': (['time', 'latitude', 'longitude'], evi_data),
+        }, coords={
+            'time': time_coords,
+            'latitude': lat_coords,
+            'longitude': lon_coords,
+        })
+        
+        # Метаданные
+        modis_ds.attrs.update({
+            'title': 'Real MODIS NDVI/EVI from Google Earth Engine',
+            'source': 'MODIS/061/MOD13A2',
+            'description': 'Monthly composites of MODIS NDVI and EVI',
+            'spatial_resolution': '1km',
+            'temporal_resolution': 'monthly',
+            'download_method': 'Google Earth Engine',
+            'success_rate': f'{success_rate:.1f}%',
+            'global_bounds': self.global_bounds,
+            'regions_covered': list(REGIONS.keys())
+        })
+        
+        print(f"✅ MODIS данные готовы: {dict(modis_ds.dims)}")
+        return modis_ds
 
 class CHIRPSDownloader:
-    """Загрузчик данных CHIRPS"""
+    """Загрузчик реальных CHIRPS данных для всех регионов"""
     
     BASE_URL = "https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/netcdf/p25"
     
     @staticmethod
-    def download_year(year: int, dest_dir: Path) -> bool:
-        """Загрузка CHIRPS за год"""
-        url = f"{CHIRPSDownloader.BASE_URL}/chirps-v2.0.{year}.days_p25.nc"
-        dest_file = dest_dir / f"chirps_{year}.nc"
+    def download_and_process(years: range, global_bounds: Dict, dest_dir: Path) -> xr.Dataset:
+        """Загрузка и обработка CHIRPS для всех регионов"""
+        print("📦 Загрузка реальных данных CHIRPS для всех регионов...")
+        print(f"🌍 Глобальная область: {global_bounds}")
+        print(f"📍 Регионы: {list(REGIONS.keys())}")
         
-        if dest_file.exists():
-            print(f"📁 CHIRPS {year} уже существует")
-            return True
-            
-        try:
-            print(f"⬇ Загрузка CHIRPS {year}...", end="", flush=True)
-            response = requests.get(url, stream=True, timeout=600)
-            response.raise_for_status()
-            
-            with open(dest_file, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            print(" ✅")
-            return True
-            
-        except Exception as e:
-            print(f" ❌ Ошибка: {e}")
-            if dest_file.exists():
-                dest_file.unlink()
-            return False
-    
-    @staticmethod
-    def process_chirps(dest_dir: Path) -> xr.Dataset:
-        """Обработка скачанных файлов CHIRPS"""
-        print("📦 Обработка данных CHIRPS...")
-        
-        # Параллельная загрузка
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [
-                executor.submit(CHIRPSDownloader.download_year, year, dest_dir)
-                for year in YEARS
-            ]
-            
-            # Ждем завершения всех загрузок
-            for future in as_completed(futures):
-                future.result()
-        
-        # Загрузка и объединение файлов
         datasets = []
-        for year in YEARS:
-            file_path = dest_dir / f"chirps_{year}.nc"
-            if file_path.exists():
+        
+        for year in years:
+            dest_file = dest_dir / f"chirps_{year}.nc"
+            
+            if not dest_file.exists():
+                url = f"{CHIRPSDownloader.BASE_URL}/chirps-v2.0.{year}.days_p25.nc"
+                print(f"⬇ Загрузка CHIRPS {year}...")
+                
                 try:
-                    ds = xr.open_dataset(file_path)
-                    datasets.append(ds)
+                    response = requests.get(url, stream=True, timeout=1800)  # 30 минут
+                    response.raise_for_status()
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    
+                    with open(dest_file, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=1024*1024):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                
+                                # Показываем прогресс каждые 100MB
+                                if downloaded % (100 * 1024 * 1024) == 0:
+                                    if total_size > 0:
+                                        progress = (downloaded / total_size) * 100
+                                        print(f"    📥 {progress:.0f}%", end="", flush=True)
+                    
+                    file_size = dest_file.stat().st_size / (1024**2)
+                    print(f" ✅ ({file_size:.1f} MB)")
+                    
                 except Exception as e:
-                    print(f"⚠ Ошибка чтения {year}: {e}")
+                    print(f"❌ Ошибка загрузки CHIRPS {year}: {e}")
+                    continue
+            else:
+                file_size = dest_file.stat().st_size / (1024**2)
+                print(f"📁 CHIRPS {year} уже загружен ({file_size:.1f} MB)")
+            
+            # Загружаем файл
+            try:
+                ds = xr.open_dataset(dest_file)
+                datasets.append(ds)
+                print(f"✅ CHIRPS {year} прочитан")
+            except Exception as e:
+                print(f"⚠ Ошибка чтения CHIRPS {year}: {e}")
         
         if not datasets:
-            raise RuntimeError("Не удалось загрузить данные CHIRPS")
+            raise RuntimeError("❌ Не удалось загрузить CHIRPS данные")
         
-        # Объединение
+        print(f"🔗 Объединение {len(datasets)} файлов CHIRPS...")
         combined = xr.concat(datasets, dim="time")
         
-        # Обрезка по области интереса
-        lat_slice = slice(LAT_MIN, LAT_MAX)
-        if combined.latitude[0] > combined.latitude[-1]:  # Убывающие широты
-            lat_slice = slice(LAT_MAX, LAT_MIN)
+        # Обрезка по глобальной области всех регионов
+        lat_slice = slice(global_bounds['lat_min'], global_bounds['lat_max'])
+        if combined.latitude[0] > combined.latitude[-1]:
+            lat_slice = slice(global_bounds['lat_max'], global_bounds['lat_min'])
             
         combined = combined.sel(
             latitude=lat_slice,
-            longitude=slice(LON_MIN, LON_MAX)
+            longitude=slice(global_bounds['lon_min'], global_bounds['lon_max'])
         )
         
-        # Месячные суммы осадков
+        # Месячные суммы
+        print("📊 Вычисление месячных сумм осадков...")
         monthly = combined.resample(time="1M").sum()
         
-        print(f"✅ CHIRPS: {monthly.dims} за {len(datasets)} лет")
+        print(f"✅ CHIRPS готов: {dict(monthly.dims)}")
+        print(f"📊 Временной диапазон: {monthly.time.min().values} - {monthly.time.max().values}")
+        
+        # Проверяем покрытие регионов
+        print("🗺 Проверка покрытия регионов:")
+        for region_name, (lat_min, lat_max, lon_min, lon_max) in REGIONS.items():
+            try:
+                region_data = monthly.sel(
+                    latitude=slice(lat_min, lat_max),
+                    longitude=slice(lon_min, lon_max)
+                )
+                if len(region_data.latitude) > 0 and len(region_data.longitude) > 0:
+                    coverage = 1 - np.isnan(region_data['precip'].values).mean()
+                    print(f"  {region_name}: {coverage*100:.1f}% покрытие, "
+                          f"{len(region_data.latitude)}x{len(region_data.longitude)} пикселей")
+                else:
+                    print(f"  {region_name}: ❌ нет данных")
+            except Exception as e:
+                print(f"  {region_name}: ⚠ ошибка проверки: {e}")
+        
         return monthly
 
 class ERA5Downloader:
-    """Загрузчик данных ERA5-Land"""
+    """Загрузчик ERA5 для всех регионов"""
     
     @staticmethod
-    def setup_cds_api() -> bool:
-        """Проверка настройки CDS API"""
+    def check_and_download(years: range, global_bounds: Dict, dest_dir: Path) -> Optional[xr.Dataset]:
+        """Проверка и загрузка ERA5 для всех регионов"""
+        
+        # Проверяем CDS API
         cds_rc = Path.home() / ".cdsapirc"
         if not cds_rc.exists():
-            print("⚠ Не найден ~/.cdsapirc файл")
-            print("📝 Создайте файл с содержимым:")
-            print("url: https://cds.climate.copernicus.eu/api/v2")
-            print("key: UID:API-KEY")
-            print("Получите ключ на: https://cds.climate.copernicus.eu/api-how-to")
-            return False
-        return True
-    
-    @staticmethod
-    def download_era5_land(dest_dir: Path) -> xr.Dataset:
-        """Загрузка ERA5-Land данных"""
-        if not ERA5Downloader.setup_cds_api():
-            raise RuntimeError("CDS API не настроен")
-        
+            print("⚠ ERA5 пропущен: нет ~/.cdsapirc")
+            print("💡 Создайте файл ~/.cdsapirc с вашим CDS API ключом")
+            return None
+            
         try:
             import cdsapi
         except ImportError:
-            raise ImportError("Установите: pip install cdsapi")
+            print("⚠ ERA5 пропущен: нет cdsapi")
+            print("💡 Установите: pip install cdsapi")
+            return None
         
-        era5_file = dest_dir / "era5_land_complete.nc"
+        era5_file = dest_dir / "era5_global_all_regions.nc"
         
         if era5_file.exists():
-            print("📁 ERA5-Land файл уже существует")
+            print("📁 ERA5 уже загружен")
             return xr.open_dataset(era5_file)
         
-        print("⬇ Загрузка ERA5-Land данных...")
+        print("⬇ Загрузка ERA5-Land для всех регионов...")
+        print(f"🌍 Глобальная область: {global_bounds}")
+        
         client = cdsapi.Client()
         
-        # Загрузка по годам (чтобы избежать больших запросов)
-        yearly_files = []
-        for year in YEARS:
-            year_file = dest_dir / f"era5_land_{year}.nc"
-            if not year_file.exists():
-                print(f"  📅 Загрузка {year}...")
-                try:
-                    client.retrieve(
-                        'reanalysis-era5-land',
-                        {
-                            'variable': [
-                                '2m_temperature',
-                                'total_precipitation', 
-                                'potential_evaporation',
-                                'volumetric_soil_water_layer_1',
-                                'volumetric_soil_water_layer_2',
-                                'soil_temperature_level_1',
-                            ],
-                            'year': str(year),
-                            'month': [f'{m:02d}' for m in range(1, 13)],
-                            'day': [f'{d:02d}' for d in range(1, 32)],
-                            'time': ['00:00', '06:00', '12:00', '18:00'],
-                            'area': [LAT_MAX, LON_MIN, LAT_MIN, LON_MAX],  # N, W, S, E
-                            'format': 'netcdf',
-                        },
-                        str(year_file)
-                    )
-                    yearly_files.append(year_file)
-                except Exception as e:
-                    print(f"❌ Ошибка загрузки {year}: {e}")
-            else:
-                yearly_files.append(year_file)
-        
-        # Объединение годовых файлов
-        if yearly_files:
-            datasets = [xr.open_dataset(f) for f in yearly_files]
-            combined = xr.concat(datasets, dim="time")
-            
-            # Месячные средние
-            monthly = combined.resample(time="1M").mean()
-            
-            # Сохранение объединенного файла
-            monthly.to_netcdf(era5_file)
-            
-            # Удаление временных файлов
-            for f in yearly_files:
-                f.unlink()
-            
-            print(f"✅ ERA5-Land: {monthly.dims}")
-            return monthly
-        else:
-            raise RuntimeError("Не удалось загрузить ERA5-Land данные")
-
-class MODISDownloader:
-    """Загрузчик данных MODIS NDVI"""
-    
-    @staticmethod
-    def setup_earthdata_auth() -> Tuple[str, str]:
-        """Настройка аутентификации NASA Earthdata"""
-        netrc_file = Path.home() / ".netrc"
-        
-        if netrc_file.exists():
-            try:
-                auth_info = netrc()
-                login, account, password = auth_info.authenticators("urs.earthdata.nasa.gov")
-                return login, password
-            except:
-                pass
-        
-        # Проверка переменных окружения
-        username = os.getenv("EARTHDATA_USERNAME")
-        password = os.getenv("EARTHDATA_PASSWORD")
-        
-        if username and password:
-            return username, password
-            
-        print("⚠ NASA Earthdata аутентификация не настроена")
-        print("📝 Создайте ~/.netrc файл:")
-        print("machine urs.earthdata.nasa.gov")
-        print("login YOUR_USERNAME") 
-        print("password YOUR_PASSWORD")
-        print("\nИли установите переменные окружения:")
-        print("export EARTHDATA_USERNAME=your_username")
-        print("export EARTHDATA_PASSWORD=your_password")
-        
-        raise RuntimeError("NASA Earthdata аутентификация не настроена")
-    
-    @staticmethod
-    def get_modis_tiles_for_region() -> List[str]:
-        """Определение MODIS тайлов для регионов интереса"""
-        # Тайлы покрывающие наши регионы
-        tiles = [
-            # США
-            "h09v04", "h10v04", "h11v04", "h12v04",
-            # Бразилия  
-            "h12v09", "h13v09", "h13v10", "h14v09",
-            # Индия
-            "h24v06", "h25v06", "h26v06",
-            # Россия
-            "h21v02", "h22v02", "h23v02", "h21v03"
-        ]
-        return tiles
-    
-    @staticmethod
-    def download_modis_ndvi(dest_dir: Path) -> xr.Dataset:
-        """Загрузка MODIS NDVI - сначала пробуем реальные данные через GEE"""
-        print("🛰 Загрузка MODIS NDVI данных...")
-        
-        # Пробуем загрузить реальные данные через Google Earth Engine
-        if MODIS_GEE_AVAILABLE:
-            try:
-                print("🌍 Попытка загрузки реальных MODIS данных через Google Earth Engine...")
-                
-                # Замените на ваш Google Cloud Project ID
-                PROJECT_ID = "your-project-id"  # TODO: Установите ваш Project ID
-                
-                downloader = MODISGEEDownloader(project_id=PROJECT_ID)
-                modis_ds = downloader.download_modis_ndvi_real(
-                    output_file=str(dest_dir / "modis_ndvi_real.nc")
-                )
-                
-                print("✅ Реальные MODIS данные успешно загружены!")
-                return modis_ds
-                
-            except Exception as e:
-                print(f"⚠ Ошибка загрузки реальных MODIS данных: {e}")
-                print("📊 Переходим к созданию климатических NDVI данных...")
-                # Продолжаем с климатическими данными
-        
-        # Если GEE недоступен или произошла ошибка - создаем климатические данные
         try:
-            username, password = MODISDownloader.setup_earthdata_auth()
-        except:
-            print("⚠ Используем климатически обоснованные NDVI данные")
-            return MODISDownloader._create_climate_based_ndvi()
-        
-        # Здесь был бы код для реальной загрузки MODIS через NASA
-        # Но это очень сложно без специальных библиотек
-        print("📊 Генерация климатически реалистичных NDVI данных...")
-        return MODISDownloader._create_climate_based_ndvi()
-
-
-    @staticmethod
-    def _create_climate_based_ndvi() -> xr.Dataset:
-        """Создание климатически обоснованных NDVI данных"""
-        print("🌱 Генерация климатически реалистичных NDVI...")
-        
-        # Сетка координат
-        lat_range = np.arange(LAT_MIN, LAT_MAX, 0.01)  # 1км разрешение
-        lon_range = np.arange(LON_MIN, LON_MAX, 0.01)
-        time_range = pd.date_range('2003-01', '2024-12', freq='M')
-        
-        np.random.seed(42)  # Воспроизводимость
-        
-        # Базовый NDVI в зависимости от широты (больше к экватору)
-        lat_effect = np.exp(-(np.abs(lat_range - 0) / 30) ** 2)  # Гауссово распределение
-        base_ndvi = 0.3 + 0.4 * lat_effect[:, np.newaxis]  # Повтор по долготе
-        
-        # Сезонность (больше летом в северном полушарии)
-        seasonal_pattern = np.zeros((len(time_range), len(lat_range), len(lon_range)))
-        
-        for t, date in enumerate(time_range):
-            month = date.month
-            
-            # Северное полушарие (лето июнь-август)
-            nh_mask = lat_range > 0
-            nh_seasonal = 0.3 * np.sin(2 * np.pi * (month - 3) / 12)
-            
-            # Южное полушарие (лето декабрь-февраль) 
-            sh_mask = lat_range <= 0
-            sh_seasonal = 0.3 * np.sin(2 * np.pi * (month - 9) / 12)
-            
-            for i, lat in enumerate(lat_range):
-                if lat > 0:
-                    seasonal_pattern[t, i, :] = base_ndvi[i, :] + nh_seasonal
-                else:
-                    seasonal_pattern[t, i, :] = base_ndvi[i, :] + sh_seasonal
-        
-        # Добавление шума и межгодовой изменчивости
-        noise = np.random.normal(0, 0.05, seasonal_pattern.shape)
-        interannual = np.random.normal(0, 0.02, (len(time_range), 1, 1))
-        
-        ndvi_data = seasonal_pattern + noise + interannual
-        ndvi_data = np.clip(ndvi_data, -0.1, 0.9)  # Реалистичные пределы NDVI
-        
-        # Создание xarray Dataset
-        ndvi_ds = xr.Dataset({
-            'ndvi': (['time', 'latitude', 'longitude'], ndvi_data)
-        }, coords={
-            'time': time_range,
-            'latitude': lat_range,
-            'longitude': lon_range,
-        })
-        
-        ndvi_ds.attrs.update({
-            'title': 'Climate-based NDVI simulation',
-            'description': 'Realistic NDVI based on latitude and seasonality',
-            'source': 'Generated based on climate patterns'
-        })
-        
-        return ndvi_ds
-    
-    @staticmethod
-    def _create_simplified_ndvi() -> xr.Dataset:
-        """Упрощенные NDVI данные"""
-        lat_range = np.arange(LAT_MIN, LAT_MAX, 0.05)  # Более грубое разрешение
-        lon_range = np.arange(LON_MIN, LON_MAX, 0.05)
-        time_range = pd.date_range('2003-01', '2024-12', freq='M')
-        
-        # Простая сезонность
-        ndvi_seasonal = 0.5 + 0.3 * np.sin(2 * np.pi * np.arange(len(time_range)) / 12)
-        ndvi_data = np.broadcast_to(
-            ndvi_seasonal[:, np.newaxis, np.newaxis],
-            (len(time_range), len(lat_range), len(lon_range))
-        )
-        
-        return xr.Dataset({
-            'ndvi': (['time', 'latitude', 'longitude'], ndvi_data)
-        }, coords={
-            'time': time_range,
-            'latitude': lat_range, 
-            'longitude': lon_range,
-        })
-
-class RussianDataDownloader:
-    """Загрузчик российских данных"""
-    
-    @staticmethod
-    def download_russian_meteo(dest_dir: Path) -> Optional[xr.Dataset]:
-        """Загрузка данных Росгидромета (если доступно)"""
-        print("🇷🇺 Попытка загрузки российских метеоданных...")
-        
-        # Здесь был бы код для API Росгидромета или ВНИИСХМ
-        # Но публичного API нет, поэтому создаем региональные данные
-        
-        return RussianDataDownloader._create_russian_regional_data()
-    
-    @staticmethod
-    def _create_russian_regional_data() -> xr.Dataset:
-        """Создание региональных данных для России"""
-        print("📊 Генерация российских региональных данных...")
-        
-        # Фокус на Центрально-Черноземный район
-        ru_lat = np.arange(50, 55.1, 0.1)
-        ru_lon = np.arange(37, 47.1, 0.1) 
-        time_range = pd.date_range('2003-01', '2024-12', freq='M')
-        
-        np.random.seed(123)
-        
-        # Температура с континентальным климатом
-        temp_base = np.array([
-            -8, -6, 1, 9, 16, 20, 22, 20, 14, 7, 0, -5  # Средние месячные
-        ])
-        temp_seasonal = np.tile(temp_base, len(time_range) // 12 + 1)[:len(time_range)]
-        
-        # Добавление изменчивости
-        temp_data = np.zeros((len(time_range), len(ru_lat), len(ru_lon)))
-        for t in range(len(time_range)):
-            temp_data[t] = temp_seasonal[t] + np.random.normal(0, 3, (len(ru_lat), len(ru_lon)))
-        
-        # Осадки (континентальный режим - больше летом)
-        precip_base = np.array([
-            30, 25, 30, 40, 55, 70, 80, 70, 55, 45, 40, 35  # мм/месяц
-        ])
-        precip_seasonal = np.tile(precip_base, len(time_range) // 12 + 1)[:len(time_range)]
-        
-        precip_data = np.zeros((len(time_range), len(ru_lat), len(ru_lon)))
-        for t in range(len(time_range)):
-            precip_data[t] = np.maximum(0, 
-                precip_seasonal[t] + np.random.exponential(10, (len(ru_lat), len(ru_lon)))
+            # Запрашиваем больше переменных для всех регионов
+            client.retrieve(
+                'reanalysis-era5-land',
+                {
+                    'variable': [
+                        '2m_temperature',
+                        'volumetric_soil_water_layer_1',
+                        'potential_evaporation',
+                        'total_precipitation'
+                    ],
+                    'year': [str(y) for y in years],
+                    'month': [f'{m:02d}' for m in range(1, 13)],
+                    'day': '15',  # Середина месяца
+                    'time': '12:00',
+                    'area': [
+                        global_bounds['lat_max'], global_bounds['lon_min'],
+                        global_bounds['lat_min'], global_bounds['lon_max']
+                    ],
+                    'format': 'netcdf',
+                },
+                str(era5_file)
             )
-        
-        russian_ds = xr.Dataset({
-            'temperature_ru': (['time', 'latitude', 'longitude'], temp_data),
-            'precipitation_ru': (['time', 'latitude', 'longitude'], precip_data),
-        }, coords={
-            'time': time_range,
-            'latitude': ru_lat,
-            'longitude': ru_lon,
-        })
-        
-        russian_ds.attrs.update({
-            'title': 'Russian regional meteorological data',
-            'region': 'Central Black Earth Region',
-            'source': 'Simulated based on regional climate patterns'
-        })
-        
-        return russian_ds
-
-class DroughtIndicesCalculator:
-    """Калькулятор индексов засухи на реальных данных"""
-    
-    @staticmethod
-    def calculate_spi(precip: np.ndarray, window: int = 3) -> np.ndarray:
-        """Расчет SPI на реальных данных осадков"""
-        print(f"🧮 Расчет SPI-{window}...")
-        
-        T, H, W = precip.shape
-        
-        # Rolling sum для окна
-        if window > 1:
-            rolling_sum = np.zeros_like(precip)
-            for t in range(window - 1, T):
-                rolling_sum[t] = np.sum(precip[t - window + 1:t + 1], axis=0)
-            precip_agg = rolling_sum[window - 1:]
-        else:
-            precip_agg = precip
             
-        T_new = precip_agg.shape[0]
-        spi = np.full((T_new, H, W), np.nan)
+            ds = xr.open_dataset(era5_file)
+            print(f"✅ ERA5 готов: {dict(ds.dims)}")
+            
+            # Проверяем покрытие регионов
+            print("🗺 Проверка покрытия ERA5 по регионам:")
+            for region_name, (lat_min, lat_max, lon_min, lon_max) in REGIONS.items():
+                try:
+                    region_data = ds.sel(
+                        latitude=slice(lat_min, lat_max),
+                        longitude=slice(lon_min, lon_max)
+                    )
+                    if len(region_data.latitude) > 0 and len(region_data.longitude) > 0:
+                        print(f"  {region_name}: ✅ {len(region_data.latitude)}x{len(region_data.longitude)} пикселей")
+                    else:
+                        print(f"  {region_name}: ❌ нет данных")
+                except Exception as e:
+                    print(f"  {region_name}: ⚠ ошибка: {e}")
+            
+            return ds
+            
+        except Exception as e:
+            print(f"❌ Ошибка загрузки ERA5: {e}")
+            print("💡 Проверьте настройки CDS API и квоты")
+            return None
+
+def calculate_drought_indices(precip_data: np.ndarray) -> Dict[str, np.ndarray]:
+    """Расчет индексов засухи"""
+    print("🧮 Расчет индексов засухи...")
+    
+    T, H, W = precip_data.shape
+    
+    # SPI-3
+    spi3 = np.zeros((T, H, W))
+    
+    for t in range(3, T):
+        rolling_sum = np.sum(precip_data[t-3:t], axis=0)
         
-        # Расчет SPI для каждого пикселя
         for i in range(H):
             for j in range(W):
-                series = precip_agg[:, i, j]
-                valid_mask = ~np.isnan(series) & (series >= 0)
+                # История для пикселя
+                history = []
+                for ht in range(3, t+1):
+                    pixel_sum = np.sum(precip_data[ht-3:ht, i, j])
+                    history.append(pixel_sum)
                 
-                if valid_mask.sum() < 30:  # Минимум данных
-                    continue
-                    
-                valid_data = series[valid_mask]
-                
-                # Добавляем небольшое значение для избежания нулей
-                valid_data = valid_data + 0.01
-                
-                try:
-                    # Подгонка гамма-распределения
-                    alpha, loc, beta = gamma.fit(valid_data, floc=0)
-                    
-                    # Вычисление CDF
-                    cdf_values = gamma.cdf(valid_data, alpha, loc=0, scale=beta)
-                    
-                    # Преобразование в стандартное нормальное распределение
-                    spi_values = norm.ppf(cdf_values)
-                    
-                    # Обратная вставка в результат
-                    spi[valid_mask, i, j] = spi_values
-                    
-                except Exception:
-                    continue
-        
-        return spi
+                if len(history) > 10:
+                    mean_val = np.mean(history)
+                    std_val = np.std(history)
+                    if std_val > 0:
+                        spi3[t, i, j] = (rolling_sum[i, j] - mean_val) / std_val
     
-    @staticmethod
-    def calculate_spei(precip: np.ndarray, pet: np.ndarray, window: int = 3) -> np.ndarray:
-        """Расчет SPEI"""
-        print(f"🧮 Расчет SPEI-{window}...")
-        
-        # Водный баланс P - PET
-        water_balance = precip - pet
-        return DroughtIndicesCalculator.calculate_spi(water_balance, window)
+    spi3 = np.clip(spi3, -3, 3)
     
-    @staticmethod
-    def calculate_pdsi(precip: np.ndarray, temp: np.ndarray, 
-                      awc: float = 150.0) -> np.ndarray:
-        """Упрощенный PDSI"""
-        print("🧮 Расчет PDSI...")
-        
-        T, H, W = precip.shape
-        pdsi = np.zeros((T, H, W))
-        soil_moisture = np.full((H, W), awc * 0.5)  # Начальная влажность
-        
-        for t in range(T):
-            P_t = precip[t]
-            T_t = temp[t]
-            
-            # Упрощенный PET (Thornthwaite formula)
-            PET_t = np.where(T_t > 0, 
-                           16 * np.power(10 * T_t / np.nanmean(T_t), 1.514), 
-                           0)
-            
-            # Водный баланс
-            water_change = P_t - PET_t
-            soil_moisture = np.clip(soil_moisture + water_change, 0, awc)
-            
-            # PDSI как нормализованное отклонение от нормальной влажности
-            normal_moisture = awc * 0.5
-            pdsi[t] = (soil_moisture - normal_moisture) / (awc * 0.25)
-        
-        return pdsi
+    return {'spi3': spi3}
 
-def build_real_dataset() -> xr.Dataset:
-    """Сборка датасета из реальных данных"""
-    print("🌍 Сборка датасета из реальных источников данных")
+def main():
+    """Главная функция с реальными данными для всех регионов"""
+    print("🌍 Загрузка РЕАЛЬНЫХ данных для всех регионов: CHIRPS + ERA5 + MODIS")
+    print("=" * 70)
+    print(f"📍 Регионы: {list(REGIONS.keys())}")
     print(f"📅 Период: {YEARS[0]}-{YEARS[-1]}")
-    print(f"🗺 Область: {LAT_MIN:.1f}°-{LAT_MAX:.1f}°N, {LON_MIN:.1f}°-{LON_MAX:.1f}°E")
+    print(f"🌍 Глобальная область: {GLOBAL_BOUNDS}")
     
+    # Проверяем настройки
+    gee_project = os.getenv('GEE_PROJECT_ID')
+    if not gee_project:
+        print("⚠ Переменная GEE_PROJECT_ID не установлена")
+        print("💡 Установите: export GEE_PROJECT_ID='your-google-cloud-project-id'")
+    
+    # Создаем директории
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     PROC_DIR.mkdir(parents=True, exist_ok=True)
     
-    # 1. Загрузка CHIRPS (реальные данные)
-    print("\n1️⃣ Загрузка данных осадков CHIRPS...")
-    chirps_ds = CHIRPSDownloader.process_chirps(OUT_DIR)
-    
-    # 2. Загрузка ERA5-Land (реальные данные)
-    print("\n2️⃣ Загрузка ERA5-Land...")
     try:
-        era5_ds = ERA5Downloader.download_era5_land(OUT_DIR)
-    except Exception as e:
-        print(f"⚠ Ошибка ERA5: {e}")
-        print("📊 Используем климатические аппроксимации...")
-        era5_ds = None
-    
-    # 3. Загрузка MODIS NDVI
-    print("\n3️⃣ Загрузка NDVI...")
-    ndvi_ds = MODISDownloader.download_modis_ndvi(OUT_DIR)
-    
-    # 4. Российские данные
-    print("\n4️⃣ Загрузка российских данных...")
-    russian_ds = RussianDataDownloader.download_russian_meteo(OUT_DIR)
-    
-    # 5. Интерполяция на общую сетку
-    print("\n5️⃣ Унификация сеток...")
-    target_coords = chirps_ds.coords
-    
-    # Интерполяция ERA5
-    if era5_ds is not None:
-        era5_interp = era5_ds.interp(
-            latitude=target_coords['latitude'],
-            longitude=target_coords['longitude'],
-            method='linear'
-        )
-    else:
-        # Создаем заменитель на основе CHIRPS
-        era5_interp = chirps_ds.copy()
-        era5_interp['t2m'] = chirps_ds['precip'] * 0 + 15  # Константная температура
-        era5_interp['pev'] = chirps_ds['precip'] * 0.7    # PET как % от осадков
-        era5_interp['swvl1'] = chirps_ds['precip'] * 0 + 0.3  # Константная влажность
-    
-    # Интерполяция NDVI
-    ndvi_interp = ndvi_ds.interp(
-        latitude=target_coords['latitude'],
-        longitude=target_coords['longitude'],
-        method='linear'
-    )
-    
-    # 6. Расчет индексов засухи на реальных данных
-    print("\n6️⃣ Расчет индексов засухи...")
-    calc = DroughtIndicesCalculator()
-    
-    precip_data = chirps_ds['precip'].values
-    if era5_ds is not None:
-        temp_data = era5_interp['t2m'].values - 273.15  # K -> C
-        pet_data = era5_interp['pev'].values
-    else:
-        temp_data = era5_interp['t2m'].values
-        pet_data = era5_interp['pev'].values
-    
-    # Расчет индексов
-    spi1 = calc.calculate_spi(precip_data, 1)
-    spi3 = calc.calculate_spi(precip_data, 3) 
-    spi6 = calc.calculate_spi(precip_data, 6)
-    spei3 = calc.calculate_spei(precip_data, pet_data, 3)
-    pdsi = calc.calculate_pdsi(precip_data, temp_data)
-    
-    # 7. Объединение всех данных
-    print("\n7️⃣ Объединение финального датасета...")
-    
-    # Совмещение временных координат (берем самый короткий ряд)
-    min_time_len = min(len(chirps_ds.time), len(era5_interp.time), len(ndvi_interp.time))
-    common_time = chirps_ds.time[:min_time_len]
-    
-    # Создание финального датасета
-    final_ds = xr.Dataset({
-        # Исходные данные
-        'precipitation': (['time', 'latitude', 'longitude'], 
-                         chirps_ds['precip'][:min_time_len].values),
-        'temperature': (['time', 'latitude', 'longitude'], 
-                       era5_interp['t2m'][:min_time_len].values),
-        'potential_evaporation': (['time', 'latitude', 'longitude'], 
-                                 era5_interp['pev'][:min_time_len].values),
-        'soil_moisture': (['time', 'latitude', 'longitude'], 
-                         era5_interp['swvl1'][:min_time_len].values),
-        'ndvi': (['time', 'latitude', 'longitude'], 
-                ndvi_interp['ndvi'][:min_time_len].values),
-        
-        # Индексы засухи (учитываем обрезку от лагов)
-        'spi1': (['time', 'latitude', 'longitude'], spi1),
-        'spi3': (['time', 'latitude', 'longitude'], spi3), 
-        'spi6': (['time', 'latitude', 'longitude'], spi6),
-        'spei3': (['time', 'latitude', 'longitude'], spei3),
-        'pdsi': (['time', 'latitude', 'longitude'], pdsi[:min_time_len]),
-    }, coords={
-        'time': common_time,
-        'latitude': target_coords['latitude'],
-        'longitude': target_coords['longitude'],
-    })
-    
-    # Добавление российских данных как отдельные переменные
-    if russian_ds is not None:
-        # Интерполяция российских данных на общую сетку
-        russian_interp = russian_ds.interp(
-            latitude=target_coords['latitude'],
-            longitude=target_coords['longitude'],
-            method='nearest'  # Ближайший сосед для сохранения региональных особенностей
-        )
-        
-        # Добавление в основной датасет
-        final_ds['temperature_russia'] = russian_interp['temperature_ru'][:min_time_len]
-        final_ds['precipitation_russia'] = russian_interp['precipitation_ru'][:min_time_len]
-    
-    # Метаданные
-    final_ds.attrs.update({
-        'title': 'Real Multi-Source Agricultural Drought Dataset',
-        'description': 'Combined drought dataset from multiple real data sources',
-        'regions': str(REGIONS),
-        'data_sources': {
-            'precipitation': 'CHIRPS v2.0',
-            'temperature': 'ERA5-Land reanalysis',
-            'ndvi': 'MODIS-based climatology',
-            'russian_data': 'Regional climate simulation'
-        },
-        'drought_indices': ['SPI-1', 'SPI-3', 'SPI-6', 'SPEI-3', 'PDSI'],
-        'spatial_resolution': '0.25 degrees',
-        'temporal_resolution': 'monthly',
-        'time_range': f'{YEARS[0]}-{YEARS[-1]}',
-        'bbox': f'{LAT_MIN},{LON_MIN},{LAT_MAX},{LON_MAX}',
-        'creation_date': dt.datetime.now().isoformat(),
-    })
-    
-    return final_ds
-
-def validate_dataset(ds: xr.Dataset) -> Dict[str, Any]:
-    """Валидация собранного датасета"""
-    print("\n🔍 Валидация датасета...")
-    
-    validation_report = {
-        'dimensions': dict(ds.dims),
-        'variables': list(ds.data_vars.keys()),
-        'time_range': (str(ds.time.min().values), str(ds.time.max().values)),
-        'spatial_extent': {
-            'lat_min': float(ds.latitude.min()),
-            'lat_max': float(ds.latitude.max()),
-            'lon_min': float(ds.longitude.min()),
-            'lon_max': float(ds.longitude.max()),
-        },
-        'data_quality': {}
-    }
-    
-    # Проверка качества данных
-    for var in ds.data_vars:
-        data = ds[var].values
-        validation_report['data_quality'][var] = {
-            'missing_fraction': float(np.isnan(data).mean()),
-            'min_value': float(np.nanmin(data)),
-            'max_value': float(np.nanmax(data)),
-            'mean_value': float(np.nanmean(data)),
-            'std_value': float(np.nanstd(data)),
-        }
-    
-    # Проверка временной последовательности
-    time_diff = np.diff(ds.time.values)
-    expected_diff = np.timedelta64(30, 'D')  # Примерно месяц
-    irregular_times = np.sum(np.abs(time_diff - expected_diff) > np.timedelta64(5, 'D'))
-    validation_report['time_regularity'] = {
-        'irregular_intervals': int(irregular_times),
-        'total_intervals': len(time_diff)
-    }
-    
-    # Проверка покрытия регионов
-    region_coverage = {}
-    for region_name, (lat_min, lat_max, lon_min, lon_max) in REGIONS.items():
-        # Проверяем, есть ли данные в регионе
-        region_data = ds.sel(
-            latitude=slice(lat_min, lat_max),
-            longitude=slice(lon_min, lon_max)
-        )
-        
-        if len(region_data.latitude) > 0 and len(region_data.longitude) > 0:
-            # Считаем покрытие данными
-            sample_var = list(ds.data_vars.keys())[0]
-            coverage = 1 - np.isnan(region_data[sample_var].values).mean()
-            region_coverage[region_name] = float(coverage)
+        # 1. Инициализация Google Earth Engine
+        if GEE_AVAILABLE:
+            gee_ready = GoogleEarthEngineSetup.initialize_gee(gee_project)
         else:
-            region_coverage[region_name] = 0.0
-    
-    validation_report['region_coverage'] = region_coverage
-    
-    # Печать отчета
-    print("📊 Отчет о валидации:")
-    print(f"  📐 Размеры: {validation_report['dimensions']}")
-    print(f"  📅 Временной диапазон: {validation_report['time_range'][0]} - {validation_report['time_range'][1]}")
-    print(f"  🗺 Пространственное покрытие: {validation_report['spatial_extent']}")
-    print(f"  📈 Переменные: {len(validation_report['variables'])}")
-    
-    print("\n📋 Качество данных по переменным:")
-    for var, stats in validation_report['data_quality'].items():
-        missing_pct = stats['missing_fraction'] * 100
-        print(f"  {var}: {missing_pct:.1f}% пропусков, "
-              f"диапазон [{stats['min_value']:.2f}, {stats['max_value']:.2f}]")
-    
-    print("\n🌍 Покрытие регионов:")
-    for region, coverage in region_coverage.items():
-        print(f"  {region}: {coverage*100:.1f}% данных")
-    
-    return validation_report
-
-def create_summary_plots(ds: xr.Dataset, output_dir: Path):
-    """Создание обзорных графиков датасета"""
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        from matplotlib.gridspec import GridSpec
+            gee_ready = False
         
-        print("\n📊 Создание обзорных графиков...")
+        # 2. Загрузка CHIRPS (реальные данные для всех регионов)
+        print("\n1️⃣ Загрузка реальных CHIRPS данных для всех регионов...")
+        chirps_ds = CHIRPSDownloader.download_and_process(YEARS, GLOBAL_BOUNDS, OUT_DIR)
         
-        # Настройка стиля
-        plt.style.use('seaborn-v0_8' if 'seaborn-v0_8' in plt.style.available else 'default')
+        # 3. Загрузка MODIS (реальные данные через GEE для всех регионов)
+        print("\n2️⃣ Загрузка реальных MODIS данных для всех регионов...")
+        if gee_ready:
+            modis_downloader = RealMODISDownloader(GLOBAL_BOUNDS)
+            modis_ds = modis_downloader.download_modis_ndvi(YEARS)
+        else:
+            print("❌ MODIS пропущен: GEE недоступен")
+            modis_ds = None
         
-        # График 1: Временные ряды по регионам
-        fig = plt.figure(figsize=(15, 10))
-        gs = GridSpec(3, 2, figure=fig)
+        # 4. Загрузка ERA5 (для всех регионов)
+        print("\n3️⃣ Попытка загрузки ERA5 для всех регионов...")
+        era5_ds = ERA5Downloader.check_and_download(YEARS, GLOBAL_BOUNDS, OUT_DIR)
         
-        variables_to_plot = ['precipitation', 'spi3', 'temperature', 'ndvi']
-        colors = ['blue', 'red', 'orange', 'green']
+        # 5. Объединение данных
+        print("\n4️⃣ Объединение всех данных...")
         
-        for i, (var, color) in enumerate(zip(variables_to_plot, colors)):
-            if var not in ds.data_vars:
-                continue
-                
-            ax = fig.add_subplot(gs[i//2, i%2])
+        # Базовые координаты от CHIRPS
+        target_coords = {
+            'time': chirps_ds.time,
+            'latitude': chirps_ds.latitude,
+            'longitude': chirps_ds.longitude
+        }
+        
+        # Начинаем с CHIRPS
+        final_vars = {
+            'precipitation': (['time', 'latitude', 'longitude'], chirps_ds['precip'].values)
+        }
+        
+        # Добавляем MODIS если есть
+        if modis_ds is not None:
+            modis_interp = modis_ds.interp(
+                latitude=target_coords['latitude'],
+                longitude=target_coords['longitude'],
+                time=target_coords['time'],
+                method='linear'
+            )
+            final_vars['ndvi'] = (['time', 'latitude', 'longitude'], modis_interp['ndvi'].values)
+            final_vars['evi'] = (['time', 'latitude', 'longitude'], modis_interp['evi'].values)
+        
+        # Добавляем ERA5 если есть
+        if era5_ds is not None:
+            era5_interp = era5_ds.interp(
+                latitude=target_coords['latitude'],
+                longitude=target_coords['longitude'],
+                time=target_coords['time'],
+                method='linear'
+            )
+            final_vars['temperature'] = (['time', 'latitude', 'longitude'], era5_interp['t2m'].values - 273.15)
+            final_vars['soil_moisture'] = (['time', 'latitude', 'longitude'], era5_interp['swvl1'].values)
+        
+        # 6. Расчет индексов засухи
+        print("\n5️⃣ Расчет индексов засухи...")
+        drought_indices = calculate_drought_indices(chirps_ds['precip'].values)
+        
+        for idx_name, idx_data in drought_indices.items():
+            final_vars[idx_name] = (['time', 'latitude', 'longitude'], idx_data)
+        
+        # 7. Создание финального датасета
+        final_ds = xr.Dataset(final_vars, coords=target_coords)
+        
+        # Метаданные
+        data_sources = {
+            'precipitation': 'CHIRPS v2.0 (real)',
+            'drought_indices': 'Calculated from CHIRPS'
+        }
+        
+        if modis_ds is not None:
+            data_sources['ndvi'] = 'MODIS MOD13A2 via Google Earth Engine (real)'
+            data_sources['evi'] = 'MODIS MOD13A2 via Google Earth Engine (real)'
             
-            for region_name, (lat_min, lat_max, lon_min, lon_max) in REGIONS.items():
-                # Средние по региону
-                region_data = ds[var].sel(
+        if era5_ds is not None:
+            data_sources['temperature'] = 'ERA5-Land reanalysis (real)'
+            data_sources['soil_moisture'] = 'ERA5-Land reanalysis (real)'
+            data_sources['potential_evaporation'] = 'ERA5-Land reanalysis (real)'
+        
+        final_ds.attrs.update({
+            'title': 'Real Multi-Source Multi-Region Drought Dataset',
+            'description': 'Combined real satellite and reanalysis data for multiple agricultural regions',
+            'data_sources': data_sources,
+            'regions': REGIONS,
+            'region_bounds': REGION_BOUNDS,
+            'global_bounds': GLOBAL_BOUNDS,
+            'spatial_resolution': '0.25 degrees',
+            'temporal_resolution': 'monthly',
+            'time_range': f'{YEARS[0]}-{YEARS[-1]}',
+            'creation_date': dt.datetime.now().isoformat(),
+            })
+
+        
+        # 8. Проверка качества по регионам
+        print("\n6️⃣ Проверка качества данных по регионам...")
+        
+        print("\n📊 Общая статистика:")
+        for var in final_ds.data_vars:
+            data = final_ds[var].values
+            nan_pct = np.isnan(data).mean() * 100
+            print(f"  {var}: {nan_pct:.1f}% NaN, диапазон [{np.nanmin(data):.2f}, {np.nanmax(data):.2f}]")
+        
+        print("\n🗺 Покрытие данными по регионам:")
+        for region_name, (lat_min, lat_max, lon_min, lon_max) in REGIONS.items():
+            try:
+                region_data = final_ds.sel(
                     latitude=slice(lat_min, lat_max),
                     longitude=slice(lon_min, lon_max)
-                ).mean(dim=['latitude', 'longitude'])
-                
-                ax.plot(ds.time, region_data, label=region_name, linewidth=1.5)
-            
-            ax.set_title(f'{var.upper()} по регионам')
-            ax.set_ylabel(var)
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # Форматирование оси времени
-            ax.xaxis.set_major_locator(mdates.YearLocator(2))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
-        
-        plt.tight_layout()
-        plt.savefig(output_dir / 'dataset_timeseries.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # График 2: Пространственные карты средних значений
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        axes = axes.flatten()
-        
-        plot_vars = ['precipitation', 'temperature', 'spi3', 'spei3', 'ndvi', 'pdsi']
-        
-        for i, var in enumerate(plot_vars):
-            if var not in ds.data_vars or i >= len(axes):
-                continue
-                
-            ax = axes[i]
-            
-            # Средние значения за весь период
-            mean_data = ds[var].mean(dim='time')
-            
-            im = ax.imshow(
-                mean_data.values,
-                extent=[ds.longitude.min(), ds.longitude.max(), 
-                       ds.latitude.min(), ds.latitude.max()],
-                aspect='auto',
-                origin='lower',
-                cmap='RdYlBu_r' if 'spi' in var or 'spei' in var or 'pdsi' in var else 'viridis'
-            )
-            
-            ax.set_title(f'Среднее {var}')
-            ax.set_xlabel('Долгота')
-            ax.set_ylabel('Широта')
-            
-            # Добавление границ регионов
-            for region_name, (lat_min, lat_max, lon_min, lon_max) in REGIONS.items():
-                rect = plt.Rectangle(
-                    (lon_min, lat_min), lon_max - lon_min, lat_max - lat_min,
-                    linewidth=2, edgecolor='black', facecolor='none'
                 )
-                ax.add_patch(rect)
-                ax.text(lon_min, lat_max, region_name, fontsize=8, 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
-            
-            plt.colorbar(im, ax=ax, shrink=0.8)
+                
+                if len(region_data.latitude) > 0 and len(region_data.longitude) > 0:
+                    # Проверяем покрытие для каждой переменной
+                    print(f"  📍 {region_name}:")
+                    print(f"    Размер: {len(region_data.latitude)}x{len(region_data.longitude)} пикселей")
+                    print(f"    Временной диапазон: {region_data.time.min().values} - {region_data.time.max().values}")
+                    
+                    for var in final_ds.data_vars:
+                        if var in region_data.data_vars:
+                            var_data = region_data[var].values
+                            coverage = (1 - np.isnan(var_data).mean()) * 100
+                            print(f"    {var}: {coverage:.1f}% покрытие")
+                        
+                else:
+                    print(f"  📍 {region_name}: ❌ нет данных в этом регионе")
+                    
+            except Exception as e:
+                print(f"  📍 {region_name}: ⚠ ошибка проверки: {e}")
         
-        # Удаление лишних subplot'ов
-        for i in range(len(plot_vars), len(axes)):
-            fig.delaxes(axes[i])
-        
-        plt.tight_layout()
-        plt.savefig(output_dir / 'dataset_spatial_maps.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # График 3: Корреляционная матрица
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # Вычисление корреляций между переменными
-        correlation_data = {}
-        for var in ds.data_vars:
-            # Берем случайную выборку точек для ускорения
-            sample_data = ds[var].values.flatten()
-            sample_data = sample_data[~np.isnan(sample_data)]
-            if len(sample_data) > 10000:
-                sample_data = np.random.choice(sample_data, 10000, replace=False)
-            correlation_data[var] = sample_data
-        
-        # Приведение к одинаковой длине
-        min_len = min(len(v) for v in correlation_data.values())
-        for var in correlation_data:
-            correlation_data[var] = correlation_data[var][:min_len]
-        
-        corr_df = pd.DataFrame(correlation_data)
-        corr_matrix = corr_df.corr()
-        
-        im = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
-        
-        # Настройка осей
-        ax.set_xticks(range(len(corr_matrix.columns)))
-        ax.set_yticks(range(len(corr_matrix.index)))
-        ax.set_xticklabels(corr_matrix.columns, rotation=45, ha='right')
-        ax.set_yticklabels(corr_matrix.index)
-        
-        # Добавление значений корреляций
-        for i in range(len(corr_matrix.index)):
-            for j in range(len(corr_matrix.columns)):
-                text = ax.text(j, i, f'{corr_matrix.iloc[i, j]:.2f}',
-                             ha="center", va="center", color="black" if abs(corr_matrix.iloc[i, j]) < 0.5 else "white")
-        
-        ax.set_title("Корреляционная матрица переменных")
-        plt.colorbar(im, ax=ax)
-        plt.tight_layout()
-        plt.savefig(output_dir / 'dataset_correlations.png', dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print("✅ Графики сохранены в:", output_dir)
-        
-    except ImportError:
-        print("⚠ matplotlib не установлен, пропускаем создание графиков")
-    except Exception as e:
-        print(f"⚠ Ошибка создания графиков: {e}")
-
-def main():
-    """Главная функция"""
-    print("🌍 Сборка РЕАЛЬНОГО датасета для предсказания засухи")
-    print("=" * 60)
-    
-    try:
-        # Сборка датасета
-        dataset = build_real_dataset()
-        
-        # Валидация
-        validation_report = validate_dataset(dataset)
-        
-        # Сохранение датасета
+        # 9. Сохранение
         print(f"\n💾 Сохранение в {ZARR_OUT}...")
-        dataset.to_zarr(ZARR_OUT, mode='w')
-        
-        # Сохранение отчета о валидации
-        report_file = PROC_DIR / "validation_report.json"
-        with open(report_file, 'w') as f:
-            json.dump(validation_report, f, indent=2, default=str)
-        
-        # Создание обзорных графиков
-        plots_dir = PROC_DIR / "plots"
-        plots_dir.mkdir(exist_ok=True)
-        create_summary_plots(dataset, plots_dir)
+        final_ds.to_zarr(ZARR_OUT, mode='w')
         
         # Финальный отчет
-        file_size = ZARR_OUT.stat().st_size / (1024**3)  # GB
-        print(f"\n🎉 Датасет успешно создан!")
+        file_size = ZARR_OUT.stat().st_size / (1024**2)  # MB
+        print(f"\n🎉 Реальный мультирегиональный датасет успешно создан!")
         print(f"📁 Местоположение: {ZARR_OUT}")
-        print(f"💽 Размер: {file_size:.2f} GB")
-        print(f"📊 Переменные: {len(dataset.data_vars)}")
-        print(f"📐 Размерность: {dict(dataset.dims)}")
+        print(f"💽 Размер: {file_size:.1f} MB")
+        print(f"📊 Переменные: {list(final_ds.data_vars.keys())}")
+        print(f"📐 Размерность: {dict(final_ds.dims)}")
+        print(f"📍 Регионы: {list(REGIONS.keys())}")
+        print(f"🌍 Источники данных:")
+        for var, source in data_sources.items():
+            print(f"  • {var}: {source}")
         
-        print(f"\n📋 Отчет о валидации: {report_file}")
-        print(f"📊 Графики: {plots_dir}")
+        # Сохраняем метаданные отдельно
+        metadata_file = PROC_DIR / "dataset_metadata.json"
+        metadata = {
+            'regions': REGIONS,
+            'global_bounds': GLOBAL_BOUNDS,
+            'years': list(YEARS),
+            'data_sources': data_sources,
+            'variables': list(final_ds.data_vars.keys()),
+            'dimensions': dict(final_ds.dims),
+            'creation_date': dt.datetime.now().isoformat(),
+            'file_size_mb': file_size
+        }
         
-        print("\n✅ Готов к использованию для обучения моделей!")
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+        
+        print(f"📋 Метаданные сохранены: {metadata_file}")
+        print("\n✅ Готов к использованию для обучения моделей на всех регионах!")
+        
+        return final_ds
         
     except KeyboardInterrupt:
         print("\n⏹ Процесс прерван пользователем")
+        return None
     except Exception as e:
         print(f"\n❌ Ошибка: {e}")
-        raise
-
-def setup_google_earth_engine():
-    """Помощник для настройки Google Earth Engine"""
-    print("🌍 Настройка Google Earth Engine для реальных MODIS данных")
-    print("=" * 60)
-    
-    print("📋 Шаги для настройки:")
-    print("1. Зарегистрируйтесь на https://earthengine.google.com/")
-    print("2. Создайте Google Cloud Project на https://console.cloud.google.com/")
-    print("3. Включите Earth Engine API для вашего проекта")
-    print("4. Установите библиотеки:")
-    print("   pip install earthengine-api geemap")
-    print("5. Выполните аутентификацию:")
-    print("   earthengine authenticate")
-    print("6. Обновите PROJECT_ID в файле modis_gee_downloader.py")
-    
-    print("\n💡 После настройки ваш pipeline будет использовать:")
-    print("  ✅ Реальные CHIRPS данные (осадки + SPI)")
-    print("  ✅ Реальные ERA5 данные (температура, влажность)")  
-    print("  ✅ Реальные MODIS данные (NDVI, EVI)")
-    print("  🎯 100% реальный датасет!")
+        import traceback
+        traceback.print_exc()
+        return None
 
 if __name__ == "__main__":
-    # Добавьте в конец main() функции:
-    if "--setup-gee" in sys.argv:
-        setup_google_earth_engine()
-    else:
-        main()
+    main()

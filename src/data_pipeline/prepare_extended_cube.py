@@ -20,6 +20,15 @@ import geemap
 from typing import Dict, Tuple, List
 import warnings
 
+# ИСПРАВЛЕНИЕ: Определение REGION_BOUNDS
+REGION_BOUNDS = {
+    "us_plains": {"lat_min": 35, "lat_max": 48, "lon_min": -104, "lon_max": -90},
+    "br_cerrado": {"lat_min": -20, "lat_max": -6, "lon_min": -62, "lon_max": -46},
+    "in_ganga": {"lat_min": 21, "lat_max": 31, "lon_min": 73, "lon_max": 90},
+    "ru_steppe": {"lat_min": 50, "lat_max": 55, "lon_min": 37, "lon_max": 47},
+}
+
+
 warnings.filterwarnings("ignore")
 
 # # Initialize Earth Engine
